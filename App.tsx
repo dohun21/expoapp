@@ -1,6 +1,7 @@
-// app/_layout.tsx
+// App.tsx
 import { Slot } from 'expo-router';
 
-export default function Layout() {
+export default function App() {
   return <Slot />;
 }
+
