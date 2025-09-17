@@ -1,4 +1,3 @@
-// app/record/date.tsx
 import { useLocalSearchParams, useRouter } from 'expo-router';
 import { onAuthStateChanged } from 'firebase/auth';
 import {
@@ -20,10 +19,10 @@ type StudyRecord = {
   totalMinutes?: number;
   seconds?: number;
 
-  // ✅ summary 필드
+  // ✅ summary 필드 (과거/현재 스키마 모두 수용)
   stars?: number;            // 0~5
   feelings?: string[];       // 오늘의 느낌 태그들
-  goalStatus?: 'success' | 'fail' | 'none';
+  goalStatus?: 'success' | 'fail' | 'none' | 'full' | 'partial';
 
   memo?: string;
 
@@ -129,6 +128,16 @@ function splitIntoSegmentsOfDay(
     }
   }
   return buckets;
+}
+
+/* ✅ goalStatus 통합(normalize): 과거('success'/'fail')와 현재('full'/'partial') 모두 지원 */
+type GoalNorm = 'full' | 'partial' | 'fail' | 'none';
+function normalizeGoalStatus(v: StudyRecord['goalStatus']): GoalNorm {
+  const s = String(v ?? 'none').toLowerCase();
+  if (s === 'success' || s === 'full') return 'full';
+  if (s === 'partial') return 'partial';
+  if (s === 'fail') return 'fail';
+  return 'none';
 }
 
 /* ===================== UI Atoms ===================== */
@@ -273,9 +282,12 @@ export default function RecordDayDetail() {
     return list.length ? list.reduce((a,b)=>a+b,0)/list.length : 0;
   }, [study]);
   const goalRate = useMemo(()=>{
-    const all = study.filter(s=>s.goalStatus && s.goalStatus!=='none');
+    const all = study.filter(s=>{
+      const g = normalizeGoalStatus(s.goalStatus);
+      return g !== 'none';
+    });
     if (!all.length) return 0;
-    const ok = all.filter(s=>s.goalStatus==='success').length;
+    const ok = all.filter(s=> normalizeGoalStatus(s.goalStatus) === 'full').length;
     return Math.round(ok/all.length*100);
   }, [study]);
 
@@ -392,6 +404,13 @@ export default function RecordDayDetail() {
         ) : study.map((r, idx) => {
           const mins = minutesFromStudy(r);
           const star = Math.max(0, Math.min(5, Math.round((r.stars ?? 0) * 10) / 10));
+          const g = normalizeGoalStatus(r.goalStatus);
+          const chipStyle =
+            g === 'full' ? { bg:'#ECFDF5', bd:'#A7F3D0', fg:GREEN[600], label:'목표 달성' } :
+            g === 'partial' ? { bg:'#FEF9C3', bd:'#FDE68A', fg:'#CA8A04', label:'일부 달성' } :
+            g === 'fail' ? { bg:'#FEE2E2', bd:'#FECACA', fg:'#DC2626', label:'목표 미달성' } :
+            null;
+
           return (
             <Card key={`s-${idx}`}>
               {/* 제목 */}
@@ -421,17 +440,17 @@ export default function RecordDayDetail() {
                 </View>
               )}
 
-              {/* 목표 달성 여부 */}
-              {r.goalStatus && r.goalStatus !== 'none' && (
+              {/* 목표 달성 여부 (full/partial/fail 지원) */}
+              {chipStyle && (
                 <View style={{
                   marginTop:10, alignSelf:'flex-start',
-                  backgroundColor: r.goalStatus==='success' ? '#ECFDF5' : '#FEF2F2',
-                  borderColor: r.goalStatus==='success' ? '#A7F3D0' : '#FECACA',
+                  backgroundColor: chipStyle.bg,
+                  borderColor: chipStyle.bd,
                   borderWidth:1, paddingVertical:6, paddingHorizontal:10,
                   borderRadius:10
                 }}>
-                  <Text style={{ fontSize:12, fontWeight:'700', color: r.goalStatus==='success' ? GREEN[600] : '#DC2626' }}>
-                    {r.goalStatus==='success' ? '목표 달성' : '목표 실패'}
+                  <Text style={{ fontSize:12, fontWeight:'700', color: chipStyle.fg }}>
+                    {chipStyle.label}
                   </Text>
                 </View>
               )}

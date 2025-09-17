@@ -1,4 +1,3 @@
-// app/session/summary.tsx
 import AsyncStorage from '@react-native-async-storage/async-storage';
 import { useLocalSearchParams, useRouter } from 'expo-router';
 import { onAuthStateChanged } from 'firebase/auth';
@@ -27,16 +26,18 @@ function extractSeconds(str: string) {
 /* ===== Component ===== */
 export default function SessionSummary() {
   const router = useRouter();
-  const { backTo, donePlanId, queue: queueParam, mode } = useLocalSearchParams<{
+  const { backTo, donePlanId, queue: queueParam, mode, pause } = useLocalSearchParams<{
     backTo?: string | string[];
     donePlanId?: string | string[];
     queue?: string | string[];
     mode?: string | string[];
+    pause?: string | string[];
   }>();
 
-  const back = Array.isArray(backTo) ? backTo[0] : backTo || '/plan/batch';
-  const doneId = Array.isArray(donePlanId) ? donePlanId[0] : donePlanId || '';
-  const rawQueue = Array.isArray(queueParam) ? queueParam[0] : queueParam || '';
+  const isPaused = (Array.isArray(pause) ? pause[0] : pause) === '1';
+  const back = isPaused ? '/home' : (Array.isArray(backTo) ? backTo[0] : backTo || '/plan/batch');
+  const doneId = isPaused ? '' : (Array.isArray(donePlanId) ? donePlanId[0] : donePlanId || '');
+  const rawQueue = isPaused ? '' : (Array.isArray(queueParam) ? queueParam[0] : queueParam || '');
 
   const [uid, setUid] = useState<string | null>(null);
   const [subject, setSubject] = useState('');
@@ -93,19 +94,32 @@ export default function SessionSummary() {
       const oldMinutes = userSnap.exists() ? userSnap.data().totalStudyMinutes || 0 : 0;
       await updateDoc(userRef, { totalStudyMinutes: oldMinutes + Math.floor(seconds / 60) });
 
-      // 다음으로 이동
-      router.replace({
-        pathname: back,
-        params: {
-          donePlanId: String(doneId || ''),
-          queue: String(rawQueue || ''),
-        },
-      } as any);
+      // ✅ 방금 완료한 계획 ID를 홈에서 자동 완료 처리할 수 있도록 저장
+      //    (pause 모드가 아닌 경우에만 의미가 있음)
+      const lastDonePlanId = (Array.isArray(donePlanId) ? donePlanId[0] : donePlanId) || '';
+      if (!isPaused && lastDonePlanId) {
+        await AsyncStorage.setItem(`lastDonePlanId_${uid}`, String(lastDonePlanId));
+      }
+
+      // 다음으로 이동: pause 모드면 홈으로, 아니면 배치/큐 이어가기
+      if (isPaused) {
+        router.replace('/home' as any);
+      } else {
+        router.replace({
+          pathname: back,
+          params: {
+            donePlanId: String(doneId || ''),
+            queue: String(rawQueue || ''),
+          },
+        } as any);
+      }
     } catch (e) {
       console.error('save error', e);
       Alert.alert('오류', '기록 저장에 실패했어요.');
     }
   };
+
+  const submitLabel = isPaused ? '기록 저장하고 홈으로' : '기록 저장하고 다음으로';
 
   return (
     <ScrollView style={{ flex: 1, backgroundColor: 'white', paddingHorizontal: 24, paddingTop: 50 }}>
@@ -157,9 +171,9 @@ export default function SessionSummary() {
         <Text style={{ fontSize: 14, fontWeight: 'bold', marginBottom: 8 }}>🎯 오늘의 목표는 달성했나요?</Text>
         <View style={{ flexDirection: 'row', gap: 8 }}>
           {[
-            { label: '✅ 완전히 달성', value: 'full', bg: '#ECFDF5', text: '#059669' },
-            { label: '🟡 일부 달성', value: 'partial', bg: '#FEF9C3', text: '#CA8A04' },
-            { label: '❌ 미달성', value: 'none', bg: '#FEE2E2', text: '#DC2626' },
+            { label: '✅ 완전히 달성', value: 'success', bg: '#ECFDF5', text: '#059669' },
+            { label: '🟡 일부 달성', value: 'none', bg: '#FEF9C3', text: '#CA8A04' },
+            { label: '❌ 미달성', value: 'fail', bg: '#FEE2E2', text: '#DC2626' },
           ].map((opt) => (
             <TouchableOpacity
               key={opt.value}
@@ -193,7 +207,7 @@ export default function SessionSummary() {
           elevation: 3,
         }}
       >
-        <Text style={{ color: '#fff', fontWeight: '600', fontSize: 14 }}>기록 저장하고 다음으로</Text>
+        <Text style={{ color: '#fff', fontWeight: '600', fontSize: 14 }}>{submitLabel}</Text>
       </TouchableOpacity>
     </ScrollView>
   );

@@ -1,13 +1,21 @@
 // app/(tabs)/record.tsx
+import AsyncStorage from '@react-native-async-storage/async-storage';
 import { useRouter } from 'expo-router';
 import { onAuthStateChanged } from 'firebase/auth';
 import {
-  Timestamp, collection, getDocs, limit, query, where,
+  Timestamp,
+  addDoc,
+  collection, getDocs, limit, query,
+  serverTimestamp,
+  where,
 } from 'firebase/firestore';
 import React, { useEffect, useMemo, useRef, useState } from 'react';
 import {
-  ActivityIndicator, Animated, Dimensions, Modal, PanResponder,
-  Platform, ScrollView, Text, TouchableOpacity, View,
+  ActivityIndicator,
+  Alert,
+  Animated, Dimensions, Modal,
+  PanResponder,
+  Platform, ScrollView, Text, TouchableOpacity, View
 } from 'react-native';
 import { auth, db } from '../../firebaseConfig';
 
@@ -45,6 +53,9 @@ type RoutineRecord = {
   email?: string; userEmail?: string;
 };
 
+type Priority = '필수' | '중요' | '선택';
+type Plan = { id: string; content: string; priority: Priority; done: boolean; createdAt: string };
+
 type TabKey = 'list' | 'calendar';
 type WeekStart = 'monday' | 'sunday';
 
@@ -53,9 +64,15 @@ const GREEN = { g1:'#A7F3D0', g2:'#6EE7B7', g3:'#34D399', g4:'#10B981', g5:'#059
 const BLUE  = { b:'#3B82F6' };
 const GRAY  = { ring:'#E5E7EB', text:'#6B7280', light:'#F3F4F6' };
 
+const { width: SCREEN_W, height: SCREEN_H } = Dimensions.get('window');
+
 /* ===================== Helpers ===================== */
 const ALT_UID_FIELDS = ['userId','ownerId','userUID'] as const;
 const ALT_EMAIL_FIELDS = ['email','userEmail'] as const;
+
+// uid별 키
+const k = (base: string, uid: string) => `${base}_${uid}`;
+const PLANS_KEY_BASE = 'todayPlans';
 
 function toDateSafe(v: any): Date {
   if (!v) return new Date(0);
@@ -94,7 +111,6 @@ function formatHM(min: number) {
   if (m === 0) return `${h}시간`;
   return `${h}시간 ${m}분`;
 }
-/** ✅ 색상: 1시간 미만도 아주 연하게 표시 */
 function minutesToColor(min?: number): string | null {
   const v = Number(min) || 0;
   if (v >= 600) return GREEN.g6;
@@ -103,10 +119,9 @@ function minutesToColor(min?: number): string | null {
   if (v >= 240) return GREEN.g3;
   if (v >= 120) return GREEN.g2;
   if (v >= 60)  return GREEN.g1;
-  if (v > 0)    return 'rgba(16,185,129,0.15)'; // 1시간 미만
+  if (v > 0)    return 'rgba(16,185,129,0.15)';
   return null;
 }
-
 function ymdKey(d: Date) {
   const dt = toDateSafe(d);
   if (isNaN(dt.getTime())) return '—';
@@ -125,24 +140,6 @@ function startOfDay(d: Date) {
 function endOfDay(d: Date) {
   const t = toDateSafe(d);
   return new Date(t.getFullYear(), t.getMonth(), t.getDate(), 23, 59, 59, 999);
-}
-function addDays(d: Date, n: number) {
-  const base = toDateSafe(d);
-  const copy = new Date(base.getTime());
-  copy.setDate(copy.getDate() + n);
-  return copy;
-}
-
-function fmtDate(d: Date) {
-  const k = toDateSafe(d);
-  const w = ['일','월','화','수','목','금','토'][k.getDay()];
-  return `${k.getFullYear()}년 ${k.getMonth()+1}월 ${k.getDate()}일 (${w})`;
-}
-function fmtTime(d: Date) {
-  const k = toDateSafe(d);
-  const hh = String(k.getHours()).padStart(2,'0');
-  const mm = String(k.getMinutes()).padStart(2,'0');
-  return `${hh}:${mm}`;
 }
 
 /* ===================== Screen ===================== */
@@ -169,29 +166,22 @@ export default function RecordScreen() {
   const [dayRoutine, setDayRoutine] = useState<RoutineRecord[]>([]);
   const [detailLoading, setDetailLoading] = useState(false);
 
-  const [plannerDate, setPlannerDate] = useState(new Date());
+  // ✅ 오늘의 계획(AsyncStorage) 로딩 및 이행도 분석 (원본 유지용)
+  const [todayPlans, setTodayPlans] = useState<Plan[]>([]);
+  const [adherence, setAdherence] = useState({
+    total:0, doneCount:0, matchedCount:0, coveragePct:0, overUnder:0, byPlan:[], recordedTotalMin:0
+  } as any);
 
-  // ✅ 범례 토글 상태
+  // 범례 토글 (달력 탭에서 사용)
   const [legendOpen, setLegendOpen] = useState(false);
 
-  // bottom sheet (기존 유지)
+  // bottom sheet
   const sheetY = useRef(new Animated.Value(400)).current;
-  const { width: screenW, height: screenH } = Dimensions.get('window');
-  const H_PAD = 20, GAP = 8, COLS = 7;
-  const CELL = Math.floor((screenW - H_PAD*2 - GAP*(COLS-1)) / COLS);
 
-  const panResponder = useRef(
-    PanResponder.create({
-      onMoveShouldSetPanResponder: (_e, g) => Math.abs(g.dy) > 6,
-      onPanResponderMove: (_e, g) => { if (g.dy > 0) sheetY.setValue(g.dy); },
-      onPanResponderRelease: (_e, g) => {
-        if (g.dy > 120) closeSheet();
-        else Animated.spring(sheetY, { toValue: 0, useNativeDriver: true, bounciness: 0 }).start();
-      },
-    })
-  ).current;
-  function openSheet(){ sheetY.setValue(400); Animated.timing(sheetY,{toValue:0,duration:200,useNativeDriver:true}).start(); }
-  function closeSheet(){ Animated.timing(sheetY,{toValue:400,duration:180,useNativeDriver:true}).start(()=>{ setDetailDate(null); setDayStudy([]); setDayRoutine([]); }); }
+  // ===== Swiper refs (원본 구조 유지, list 탭에서는 사용 안함) =====
+  const pagerRef = useRef<ScrollView>(null);
+  const [page, setPage] = useState(0);
+  const PAGES = 5;
 
   /* ------------- auth ------------- */
   useEffect(() => {
@@ -205,7 +195,6 @@ export default function RecordScreen() {
   /* ------------- load data ------------- */
   useEffect(() => {
     if (!authChecked || !uid) return;
-    // 계정 전환 시 잔상 제거
     setRecentStudy([]);
     setRecentRoutine([]);
     setDailyTotals({});
@@ -213,13 +202,27 @@ export default function RecordScreen() {
     (async () => {
       setLoading(true);
       try {
-        await Promise.all([loadRecent(uid), loadMonth(uid, year, month0)]);
+        await Promise.all([loadRecent(uid), loadMonth(uid, year, month0), loadPlans(uid)]);
       } finally { if (!cancelled) setLoading(false); }
     })();
     return () => { cancelled = true; };
   }, [authChecked, uid, year, month0]);
 
-  /* ------------- Firestore loaders ------------- */
+  // 오늘의 계획 로드 (원본 유지)
+  async function loadPlans(userId: string) {
+    try {
+      const raw = await AsyncStorage.getItem(k(PLANS_KEY_BASE, userId));
+      if (!raw) { setTodayPlans([]); return; }
+      const parsed: Plan[] = JSON.parse(raw);
+      const todayKey = ymdKey(new Date());
+      const onlyToday = parsed.filter(p => ymdKey(new Date(p.createdAt)) === todayKey);
+      setTodayPlans(onlyToday);
+    } catch {
+      setTodayPlans([]);
+    }
+  }
+
+  /* ------------- Firestore loaders (원본 로더 그대로) ------------- */
   async function loadRecent(userId: string) {
     const userEmail = auth.currentUser?.email ?? null;
 
@@ -228,7 +231,6 @@ export default function RecordScreen() {
         const snap = await getDocs(query(collection(db, 'studyRecords'), where('uid', '==', userId), limit(500)));
         if (!snap.empty) return snap.docs.map(d => d.data() as StudyRecord);
       } catch {}
-      // 과거 스키마 호환
       for (const f of ALT_UID_FIELDS) {
         try {
           const snap = await getDocs(query(collection(db, 'studyRecords'), where(f as any, '==', userId), limit(500)));
@@ -280,7 +282,6 @@ export default function RecordScreen() {
       createdAt: pickDate(s),
     }));
 
-    // 내림차순 정렬
     ssNorm.sort((a,b)=> pickDate(b).getTime()-pickDate(a).getTime());
     rrNorm.sort((a,b)=> pickDate(b).getTime()-pickDate(a).getTime());
 
@@ -288,7 +289,7 @@ export default function RecordScreen() {
     setRecentRoutine(rrNorm);
   }
 
-  /** ✅ 월 집계: 공부 + 루틴 */
+  /** ✅ 월 집계: 공부 + 루틴 (달력용 / 원본 유지) */
   async function loadMonth(userId: string, y: number, m0: number) {
     const from = new Date(y, m0, 1, 0,0,0,0);
     const to   = new Date(y, m0+1, 0, 23,59,59,999);
@@ -374,78 +375,74 @@ export default function RecordScreen() {
     openSheet();
   }
 
-  /* ------------- Derived (플래너/주간 통계만) ------------- */
-  type Segment = { kind:'study'|'routine'; label: string; start: Date; end: Date; minutes: number };
-  const dayStart = useMemo(() => startOfDay(plannerDate), [plannerDate]);
-  const dayEnd   = useMemo(() => endOfDay(plannerDate),   [plannerDate]);
+  /* ------------- 분석 파생값 (습관 전용 심플 버전) ------------- */
 
-  const plannerSegments: Segment[] = useMemo(() => {
-    const segs: Segment[] = [];
+  // 최근 N일 범위 필터 (원본 함수와 동일 로직)
+  function withinDays(dt: Date, days: number) {
+    const end = endOfDay(new Date());
+    const start = startOfDay(new Date(end.getTime() - (days-1) * 24 * 60 * 60 * 1000));
+    return dt >= start && dt <= end;
+  }
 
-    recentStudy.forEach(r => {
-      const end = pickDate(r);
-      const m = minutesFromStudy(r);
-      if (!m || m <= 0) return;
-      const start = new Date(end.getTime() - m*60*1000);
-      if (end < dayStart || start > dayEnd) return;
-      const s = new Date(Math.max(start.getTime(), dayStart.getTime()));
-      const e = new Date(Math.min(end.getTime(),   dayEnd.getTime()));
-      const mm = Math.max(1, Math.round((e.getTime()-s.getTime())/60000));
-      const label = `${r.subject ?? '공부'}${r.content ? ' · ' + r.content : ''}`;
-      segs.push({ kind:'study', label, start:s, end:e, minutes:mm });
-    });
-
+  // 루틴 제목별 “기록한 날(YYYY-MM-DD)” 집합
+  const habits = useMemo(() => {
+    const grouped = new Map<string, Set<string>>();
     recentRoutine.forEach(r => {
-      const end = pickDate(r);
-      const m = totalMinutesFromRoutine(r);
-      if (!m || m <= 0) return;
-      const start = new Date(end.getTime() - m*60*1000);
-      if (end < dayStart || start > dayEnd) return;
-      const s = new Date(Math.max(start.getTime(), dayStart.getTime()));
-      const e = new Date(Math.min(end.getTime(),   dayEnd.getTime()));
-      const mm = Math.max(1, Math.round((e.getTime()-s.getTime())/60000));
-      segs.push({ kind:'routine', label: r.title ?? '루틴', start:s, end:e, minutes:mm });
-    });
-
-    segs.sort((a,b)=> a.start.getTime()-b.start.getTime());
-    return segs;
-  }, [recentStudy, recentRoutine, dayStart.getTime(), dayEnd.getTime()]);
-
-  const weekStats = useMemo(() => {
-    const to = new Date(), from = new Date(); from.setDate(to.getDate()-6);
-    let totalMin = 0;
-    const bySubject = new Map<string, number>();
-    let goals = { total: 0, success: 0 };
-
-    recentStudy.forEach(r => {
+      const title = (r.title ?? '루틴').trim();
       const d = pickDate(r);
-      if (d < startOfDay(from) || d > endOfDay(to)) return;
-      const m = minutesFromStudy(r);
-      totalMin += m;
-      const subj = r.subject || '기타';
-      bySubject.set(subj, (bySubject.get(subj) || 0) + m);
-      if (r.goalStatus) { goals.total += 1; if (r.goalStatus === 'success') goals.success += 1; }
+      if (!withinDays(d, 180)) return;
+      const key = ymdKey(d);
+      if (!grouped.has(title)) grouped.set(title, new Set());
+      grouped.get(title)!.add(key);
     });
 
-    const total = Array.from(bySubject.values()).reduce((a,b)=>a+b,0);
-    const subjectLine = total===0 ? '데이터 없음'
-      : Array.from(bySubject.entries())
-        .sort((a,b)=>b[1]-a[1]).slice(0,6)
-        .map(([name, min]) => `${name} ${Math.round(min/total*100)}%`).join(', ');
-
-    return {
-      totalMin,
-      avgMin: Math.round(totalMin / 7),
-      subjectLine,
-      goalRate: goals.total===0 ? 0 : Math.round(goals.success/goals.total*100),
+    const todayKey = ymdKey(new Date());
+    type Habit = { title: string; todayDone: boolean; current: number; best: number; weekCount: number };
+    const calcStreak = (days: Set<string>) => {
+      // current
+      let cur = 0; { let d = new Date(); while (days.has(ymdKey(d))) { cur += 1; d.setDate(d.getDate()-1); } }
+      // best
+      let best = 0, run = 0;
+      let d = new Date(); d.setDate(d.getDate()-179);
+      for (let i=0;i<180;i++){
+        if (days.has(ymdKey(d))) run += 1; else { best = Math.max(best, run); run = 0; }
+        d.setDate(d.getDate()+1);
+      }
+      best = Math.max(best, run);
+      return { cur, best };
     };
-  }, [recentStudy]);
+    const weekCount = (days: Set<string>) => {
+      const today = new Date();
+      const dow = (today.getDay()+6)%7; // 월=0
+      const monday = new Date(today); monday.setDate(today.getDate()-dow); monday.setHours(0,0,0,0);
+      let c = 0;
+      for (let i=0;i<7;i++){ const d=new Date(monday); d.setDate(monday.getDate()+i); if (days.has(ymdKey(d))) c++; }
+      return c;
+    };
 
+    const list: Habit[] = [];
+    grouped.forEach((days, title) => {
+      const { cur, best } = calcStreak(days);
+      list.push({ title, todayDone: days.has(todayKey), current: cur, best, weekCount: weekCount(days) });
+    });
+
+    // 정렬: 오늘 미완료 ↑ → 연속 적은 ↑ (보완 먼저)
+    list.sort((a,b)=>{
+      if (a.todayDone !== b.todayDone) return a.todayDone ? 1 : -1;
+      if (a.current !== b.current) return a.current - b.current;
+      return a.title.localeCompare(b.title);
+    });
+    return list;
+  }, [recentRoutine]);
+
+  // 이번 주 전체 합계 (모든 습관의 weekCount 합)
+  const weeklySum = useMemo(()=> habits.reduce((a,b)=>a+b.weekCount,0), [habits]);
+
+  /* ------------- Calendar 계산 (원본 유지) ------------- */
   const daysInThisMonth = getDaysInMonth(year, month0);
   const firstWd = firstWeekday(year, month0, weekStart);
   const monthTitle = `${year}년 ${month0+1}월`;
 
-  /** ✅ 이번 달 합계(공부+루틴) */
   const totalThisMonth = useMemo(() => {
     let sum = 0;
     for (let i=1;i<=daysInThisMonth;i++) {
@@ -485,62 +482,44 @@ export default function RecordScreen() {
       </View>
 
       {tab==='list' ? (
-        <ScrollView style={{ flex:1 }} contentContainerStyle={{ paddingHorizontal:20, paddingBottom:40 }}>
-          {/* ======= 스터디 플래너 ======= */}
-          <View style={{ backgroundColor:'#fff', borderRadius:12, borderWidth:1, borderColor:'#E5E7EB', padding:12, marginBottom:12 }}>
-            {/* 날짜 네비 */}
-            <View style={{ flexDirection:'row', alignItems:'center', justifyContent:'space-between', marginBottom:8 }}>
-              <TouchableOpacity onPress={()=>setPlannerDate(d=>addDays(d,-1))} style={{ padding:6 }}>
-                <Text style={{ fontSize:18 }}>〈</Text>
-              </TouchableOpacity>
-              <Text style={{ fontSize:15, fontWeight:'800' }}>{fmtDate(plannerDate)}</Text>
-              <View style={{ flexDirection:'row', alignItems:'center' }}>
-                <TouchableOpacity onPress={()=>setPlannerDate(new Date())} style={{ paddingVertical:6, paddingHorizontal:10, marginRight:6, borderWidth:1, borderColor:'#E5E7EB', borderRadius:8 }}>
-                  <Text style={{ fontSize:12 }}>오늘</Text>
-                </TouchableOpacity>
-                <TouchableOpacity onPress={()=>setPlannerDate(d=>addDays(d,1))} style={{ padding:6 }}>
-                  <Text style={{ fontSize:18 }}>〉</Text>
-                </TouchableOpacity>
-              </View>
-            </View>
+        // ======= 새 습관 대시보드 (심플) =======
+        <ScrollView style={{ flex:1 }} contentContainerStyle={{ paddingHorizontal:20, paddingBottom:32 }}>
+          <Card>
+            <Text style={{ fontSize:15, fontWeight:'800', marginBottom:8 }}>📅 이번 주 습관 진행</Text>
+            <ProgressBar value={weeklySum} max={Math.max(1, habits.length * 3 /*기본 주3회 가정*/)} />
+            <Text style={{ fontSize:12, color: GRAY.text, marginTop:6 }}>
+              각 루틴을 하루 1회로 집계해요. “오늘 완료”를 누르면 streak에 바로 반영돼요.
+            </Text>
+          </Card>
 
-            <View style={{ flexDirection:'row' }}>
-              {/* 좌: 그날 항목 목록 */}
-              <View style={{ flex:1, paddingRight:10 }}>
-                {plannerSegments.length === 0 ? (
-                  <Text style={{ color: GRAY.text }}>이 날짜에 기록이 없어요.</Text>
-                ) : plannerSegments.map((s, i) => (
-                  <View key={i} style={{ paddingVertical:8, borderBottomWidth: i===plannerSegments.length-1?0:1, borderColor:'#F3F4F6' }}>
-                    <Text style={{ fontSize:14, fontWeight:'700' }}>
-                      {s.kind==='study' ? '📚 ' : '✅ '}{s.label}
-                    </Text>
-                    <Text style={{ fontSize:12, color: GRAY.text, marginTop:2 }}>
-                      {fmtTime(s.start)}–{fmtTime(s.end)} · {formatHM(s.minutes)}
-                    </Text>
-                  </View>
-                ))}
-              </View>
-
-              {/* 우: 시간표 색칠 */}
-              <View style={{ width: 180 }}>
-                <TimeTable segments={plannerSegments} windowStart={dayStart} />
-              </View>
-            </View>
-          </View>
-
-          {/* 📊 주간 공부 분석 (유지) */}
-          <View style={{ backgroundColor:'#fff', borderRadius:12, borderWidth:1, borderColor:'#E5E7EB', padding:12, marginBottom:12 }}>
-            <Text style={{ fontSize:15, fontWeight:'800', marginBottom:10 }}>📊 주간 공부 분석</Text>
-            <InfoRow label="이번 주 총 공부 시간" value={formatHM(weekStats.totalMin)} />
-            <InfoRow label="과목별 분포" value={weekStats.subjectLine} />
-            <InfoRow label="목표 달성률" value={`${(weekStats.goalRate)}%`} />
-            <InfoRow label="이번 주 평균 공부 시간" value={formatHM(weekStats.avgMin)} last />
-          </View>
-
+          {habits.length===0 ? (
+            <Card><Text style={{ color: GRAY.text }}>루틴 기록이 아직 없어요. 루틴을 실행하면 습관 카드가 생겨요.</Text></Card>
+          ) : habits.map(h => (
+            <HabitCard
+              key={h.title}
+              title={h.title}
+              current={h.current}
+              best={h.best}
+              weekCount={h.weekCount}
+              todayDone={h.todayDone}
+              onPressDone={async ()=>{
+                if (h.todayDone) { Alert.alert('오늘 완료됨', '이미 오늘 완료했어요.'); return; }
+                try {
+                  await addDoc(collection(db,'routineRecords'), {
+                    uid, title: h.title, createdAt: serverTimestamp(),
+                  });
+                  // 낙관적 갱신
+                  setRecentRoutine(prev => [{ uid: uid!, title: h.title, createdAt: new Date() }, ...prev]);
+                } catch (e) {
+                  Alert.alert('오류','기록 저장 중 문제가 발생했어요.');
+                }
+              }}
+            />
+          ))}
         </ScrollView>
       ) : (
-        // Calendar tab
-        <ScrollView style={{ flex:1 }} contentContainerStyle={{ paddingHorizontal:H_PAD, paddingBottom:40 }}>
+        // ===== Calendar tab (원본 그대로 유지) =====
+        <ScrollView style={{ flex:1 }} contentContainerStyle={{ paddingHorizontal:20, paddingBottom:40 }}>
           {/* month nav */}
           <View style={{ flexDirection:'row', alignItems:'center', justifyContent:'space-between', marginBottom:10 }}>
             <TouchableOpacity onPress={()=>{ const m=month0-1; if(m<0){ setYear(y=>y-1); setMonth0(11);} else setMonth0(m); }} style={{ padding:6 }}>
@@ -561,97 +540,35 @@ export default function RecordScreen() {
           </View>
 
           {/* week header */}
-          <View style={{ flexDirection:'row', justifyContent:'space-between', marginTop:6, marginBottom:6 }}>
-            {(weekStart==='monday'?['월','화','수','목','금','토','일']:['일','월','화','수','목','금','토']).map(w=>(
-              <View key={w} style={{ width: CELL, alignItems:'center' }}>
-                <Text style={{ color: GRAY.text, fontSize:12 }}>{w}</Text>
-              </View>
-            ))}
-          </View>
+          <WeekHeader />
 
           {/* grid */}
-          <View style={{ flexDirection:'row', flexWrap:'wrap' }}>
-            {Array.from({length:firstWd}).map((_,i)=>(
-              <View key={`empty-${i}`} style={{ width:CELL, height:CELL, marginRight:(i%COLS)===COLS-1?0:GAP, marginBottom:GAP }} />
-            ))}
-            {Array.from({length:getDaysInMonth(year,month0)},(_,i)=>i+1).map((day,i)=>{
-              const col = (firstWd + i) % COLS;
-              const d = new Date(year, month0, day);
-              const key = ymdKey(d);
-              const total = dailyTotals[key] || 0;
-              const bg = minutesToColor(total);
-              return (
-                <TouchableOpacity
-                  key={day}
-                  onPress={()=>router.push({ pathname: '/record/date', params: { date: key } })}
-                  onLongPress={()=>openDayDetail(d)}
-                  delayLongPress={220}
-                  style={{
-                    width:CELL, height:CELL,
-                    marginRight: col===COLS-1 ? 0 : GAP, marginBottom:GAP,
-                    borderRadius: CELL/2,
-                    borderWidth: bg?0:1, borderColor: GRAY.ring,
-                    backgroundColor: bg || '#fff',
-                    alignItems:'center', justifyContent:'center',
-                  }}>
-                  <Text style={{ fontWeight:'700', fontSize:13, color: bg?'#fff':'#111827' }}>{day}</Text>
-                </TouchableOpacity>
-              );
-            })}
-          </View>
+          <CalendarGrid
+            year={year}
+            month0={month0}
+            firstWd={firstWd}
+            dailyTotals={dailyTotals}
+            onPressDay={(d)=>router.push({ pathname: '/record/date', params: { date: ymdKey(d) } })}
+            onLongPressDay={openDayDetail}
+          />
 
-          {/* ✅ 범례 (터치로 펼치기/접기) */}
-          <View style={{ marginTop:10, backgroundColor:'#fff', borderRadius:12, borderWidth:1, borderColor:'#E5E7EB' }}>
-            <TouchableOpacity
-              onPress={()=>setLegendOpen(o=>!o)}
-              style={{ paddingVertical:12, paddingHorizontal:12, flexDirection:'row', alignItems:'center', justifyContent:'space-between' }}
-              activeOpacity={0.7}
-            >
-              <Text style={{ fontSize:14, fontWeight:'800' }}>범례</Text>
-              <Text style={{ fontSize:16, color: GRAY.text }}>{legendOpen ? '▾' : '▸'}</Text>
-            </TouchableOpacity>
-
-            {legendOpen && (
-              <View style={{ paddingHorizontal:12, paddingBottom:12 }}>
-                {[
-                  { label:'10시간 이상', color:GREEN.g6 },
-                  { label:'8–9시간',   color:GREEN.g5 },
-                  { label:'6–7시간',   color:GREEN.g4 },
-                  { label:'4–5시간',   color:GREEN.g3 },
-                  { label:'2–3시간',   color:GREEN.g2 },
-                  { label:'1시간',     color:GREEN.g1 },
-                  { label:'1시간 미만', color:'rgba(16,185,129,0.15)' },
-                  { label:'기록 없음', color:'transparent', ring:true },
-                ].map((it,idx)=>(
-                  <View key={idx} style={{ flexDirection:'row', alignItems:'center', marginBottom:6 }}>
-                    <View style={{
-                      width:16, height:16, borderRadius:8, marginRight:8,
-                      backgroundColor: it.color==='transparent' ? '#fff' : it.color,
-                      borderWidth: it.ring?1:0, borderColor: GRAY.ring,
-                    }}/>
-                    <Text>{it.label}</Text>
-                  </View>
-                ))}
-              </View>
-            )}
-          </View>
+          {/* 범례 */}
+          <Legend legendOpen={legendOpen} setLegendOpen={setLegendOpen} />
         </ScrollView>
       )}
 
-      {/* bottom sheet (기존 그대로) */}
+      {/* bottom sheet (하루 상세) */}
       <Modal visible={!!detailDate} transparent animationType="none" onRequestClose={closeSheet}>
         <TouchableOpacity activeOpacity={1} onPress={closeSheet} style={{ flex:1, backgroundColor:'rgba(0,0,0,0.2)' }} />
         <Animated.View
           style={{
-            position:'absolute', left:0, right:0, bottom:0, maxHeight:screenH*0.75,
+            position:'absolute', left:0, right:0, bottom:0, maxHeight:SCREEN_H*0.75,
             backgroundColor:'#fff', borderTopLeftRadius:16, borderTopRightRadius:16, paddingBottom:24,
             transform:[{ translateY: sheetY }],
           }}
-          {...panResponder.panHandlers}
+          {...panResponder().panHandlers}
         >
-          <View style={{ alignItems:'center', paddingTop:8 }}>
-            <View style={{ width:36, height:5, borderRadius:999, backgroundColor: GRAY.light }} />
-          </View>
+          <SheetHandle />
           <View style={{ paddingHorizontal:20, paddingTop:10 }}>
             <Text style={{ fontSize:16, fontWeight:'800' }}>{detailDate ? ymdKey(detailDate) : ''}</Text>
           </View>
@@ -695,6 +612,20 @@ export default function RecordScreen() {
       </Modal>
     </View>
   );
+
+  // helpers (inside component to capture refs/state)
+  function panResponder() {
+    return PanResponder.create({
+      onMoveShouldSetPanResponder: (_e, g) => Math.abs(g.dy) > 6,
+      onPanResponderMove: (_e, g) => { if (g.dy > 0) sheetY.setValue(g.dy); },
+      onPanResponderRelease: (_e, g) => {
+        if (g.dy > 120) closeSheet();
+        else Animated.spring(sheetY, { toValue: 0, useNativeDriver: true, bounciness: 0 }).start();
+      },
+    });
+  }
+  function openSheet(){ sheetY.setValue(400); Animated.timing(sheetY,{toValue:0,duration:200,useNativeDriver:true}).start(); }
+  function closeSheet(){ Animated.timing(sheetY,{toValue:400,duration:180,useNativeDriver:true}).start(()=>{ setDetailDate(null); setDayStudy([]); setDayRoutine([]); }); }
 }
 
 /* ===================== Small Components ===================== */
@@ -702,7 +633,7 @@ function Card({ children }: { children: React.ReactNode }) {
   return (
     <View style={{
       backgroundColor:'#fff', borderRadius:12, borderWidth:1, borderColor:'#E5E7EB',
-      padding:12, marginBottom:8, shadowColor:'#000', shadowOpacity:0.06, shadowRadius:6,
+      padding:12, marginBottom:12, shadowColor:'#000', shadowOpacity:0.06, shadowRadius:6,
       shadowOffset:{ width:0, height:3 }, elevation:2,
     }}>
       {children}
@@ -722,102 +653,276 @@ function InfoRow({ label, value, last }: { label: string; value: string | number
   );
 }
 
-/* ===================== Time table (06~다음날 05) ===================== */
-function TimeTable({
-  segments,
-  windowStart,
-}: {
-  segments: { kind:'study'|'routine'; start: Date; end: Date; minutes: number }[];
-  windowStart: Date;
-}) {
-  const HOUR_H = 30;
-  const TOTAL_H = HOUR_H * 24;
-  const PX_PER_MIN = HOUR_H / 60;
-
-  const PIVOT = 6;
-  const hourOrder = Array.from({ length: 24 }, (_, i) => (i + PIVOT) % 24);
-  const hourLabels = hourOrder.map((h) => String(h).padStart(2, '0'));
-
-  const base = (() => {
-    const b = toDateSafe(windowStart);
-    return new Date(b.getFullYear(), b.getMonth(), b.getDate(), PIVOT, 0, 0, 0);
-  })();
-
-  const toYRaw = (d: Date) => {
-    const dt = toDateSafe(d);
-    let diffMin = (dt.getTime() - base.getTime()) / 60000;
-    if (diffMin < 0) diffMin += 24 * 60;
-    diffMin = Math.max(0, Math.min(24 * 60, diffMin));
-    return diffMin * PX_PER_MIN;
-  };
-  const toY = (d: Date) => Math.round(toYRaw(d));
-
+/* ===== Habit mini components ===== */
+function ProgressBar({ value, max }:{ value:number; max:number }) {
+  const safeMax = Math.max(1, max);
+  const pct = Math.max(0, Math.min(100, Math.round((value/safeMax)*100)));
   return (
-    <View style={{ flexDirection: 'row' }}>
-      {/* 시간 라벨 (06 → 05) */}
-      <View style={{ width: 32, marginRight: 6 }}>
-        {hourLabels.map((label, i) => (
-          <View key={i} style={{ height: 30, justifyContent: 'flex-start' }}>
-            <Text style={{ fontSize: 10, color: GRAY.text }}>{label}</Text>
-          </View>
-        ))}
+    <View>
+      <View style={{ height:14, backgroundColor:'#F3F4F6', borderRadius:999, overflow:'hidden' }}>
+        <View style={{ width:`${pct}%`, height:'100%', backgroundColor:'#10B981' }} />
       </View>
-
-      {/* 그리드 + 채움 */}
-      <View
-        style={{
-          flex: 1,
-          height: TOTAL_H,
-          position: 'relative',
-          borderWidth: 1,
-          borderColor: '#EEF2F7',
-          borderRadius: 10,
-          overflow: 'hidden',
-          backgroundColor: '#FFFFFF',
-        }}
-      >
-        {hourLabels.map((_, i) => (
-          <View
-            key={i}
-            style={{
-              position: 'absolute',
-              left: 0,
-              right: 0,
-              top: i * 30,
-              height: 1,
-              backgroundColor: '#F3F4F6',
-            }}
-          />
-        ))}
-
-        {segments.map((s, idx) => {
-          const top = toY(s.start);
-          const bottom = toY(s.end);
-          const rawHeight = bottom - top;
-          const height = Math.max(14, Math.round(rawHeight));
-          const isStudy = s.kind === 'study';
-
-          const bg = isStudy ? 'rgba(16,185,129,0.55)' : 'rgba(59,130,246,0.55)';
-          const stroke = isStudy ? GREEN.g4 : BLUE.b;
-
-          return (
-            <View
-              key={idx}
-              style={{
-                position: 'absolute',
-                left: 1,
-                right: 1,
-                top,
-                height,
-                backgroundColor: bg,
-                borderWidth: 1,
-                borderColor: stroke,
-                borderRadius: 6,
-              }}
-            />
-          );
-        })}
+      <View style={{ flexDirection:'row', justifyContent:'space-between', marginTop:6 }}>
+        <Text style={{ fontSize:12, color: GRAY.text }}>진행도</Text>
+        <Text style={{ fontSize:12, fontWeight:'700' }}>{value}/{safeMax} · {pct}%</Text>
       </View>
     </View>
   );
 }
+function Pill({ text }:{ text:string }) {
+  return (
+    <View style={{ backgroundColor:'#F3F4F6', borderRadius:999, paddingHorizontal:10, paddingVertical:6 }}>
+      <Text style={{ fontSize:11 }}>{text}</Text>
+    </View>
+  );
+}
+function Button({ text, onPress, filled=false, disabled=false }:{
+  text:string; onPress:()=>void; filled?:boolean; disabled?:boolean
+}) {
+  return (
+    <TouchableOpacity
+      onPress={onPress}
+      disabled={disabled}
+      style={{
+        paddingHorizontal:14, paddingVertical:10, borderRadius:10,
+        backgroundColor: filled ? (disabled?'#9CA3AF':'#10B981') : '#fff',
+        borderWidth: filled ? 0 : 1, borderColor: '#E5E7EB',
+        opacity: disabled ? 0.9 : 1,
+      }}
+    >
+      <Text style={{ color: filled ? '#fff' : '#111827', fontWeight:'700' }}>{text}</Text>
+    </TouchableOpacity>
+  );
+}
+function HabitCard({
+  title, current, best, weekCount, todayDone, onPressDone
+}:{
+  title:string; current:number; best:number; weekCount:number; todayDone:boolean; onPressDone:()=>void
+}) {
+  return (
+    <Card>
+      <Text style={{ fontSize:16, fontWeight:'800', marginBottom:8 }}>{title}</Text>
+      <View style={{ flexDirection:'row', gap:8, marginBottom:8, flexWrap:'wrap' }}>
+        <Pill text={`연속 ${current}일`} />
+        <Pill text={`최장 ${best}일`} />
+        <Pill text={`이번 주 ${weekCount}회`} />
+        <Pill text={todayDone ? '오늘 완료' : '오늘 미완료'} />
+      </View>
+      <View style={{ flexDirection:'row', justifyContent:'flex-end', marginTop:4 }}>
+        <Button
+          text={todayDone ? '오늘 기록됨' : '오늘 완료'}
+          onPress={onPressDone}
+          filled
+          disabled={todayDone}
+        />
+      </View>
+    </Card>
+  );
+}
+
+/* ===== Bars / Heat components / Calendar parts (원본 유지) ===== */
+function MiniBars({ data, labels, max }:{ data:number[]; labels:string[]; max:number }) {
+  const safeMax = Math.max(1, max);
+  return (
+    <View style={{ flexDirection:'row', alignItems:'flex-end', marginTop:10 }}>
+      {data.map((v,i)=>(
+        <View key={i} style={{ flex:1, alignItems:'center' }}>
+          <View style={{
+            width:10,
+            height: Math.max(4, Math.round((v/safeMax)*60)),
+            backgroundColor:'#10B981',
+            borderRadius:4,
+          }}/>
+        </View>
+      ))}
+    </View>
+  );
+}
+
+function HourHeat({ hours, max }:{ hours:number[]; max:number }) {
+  const labels = Array.from({length:24},(_,i)=>String(i).padStart(2,'0'));
+  const safeMax = Math.max(1, max);
+  return (
+    <View style={{ flexDirection:'row', flexWrap:'wrap' }}>
+      {hours.map((v,i)=>{
+        const ratio = v/safeMax;
+        const bg = `rgba(16,185,129,${0.15 + ratio*0.7})`;
+        return (
+          <View key={i} style={{ width:'12.5%', padding:4 }}>
+            <View style={{
+              height:22, borderRadius:6, backgroundColor: bg, borderWidth:1, borderColor:'#E5E7EB',
+              alignItems:'center', justifyContent:'center'
+            }}>
+              <Text style={{ fontSize:9, color:'#0F172A' }}>{labels[i]}</Text>
+            </View>
+          </View>
+        );
+      })}
+    </View>
+  );
+}
+
+function WeekdayBars({ values, max }:{ values:number[]; max:number }) {
+  const names = ['일','월','화','수','목','금','토'];
+  const safeMax = Math.max(1, max);
+  return (
+    <View>
+      {values.map((v,i)=>(
+        <View key={i} style={{ marginBottom:8 }}>
+          <View style={{ flexDirection:'row', justifyContent:'space-between', marginBottom:4 }}>
+            <Text style={{ fontSize:13 }}>{names[i]}</Text>
+            <Text style={{ fontSize:12, color: GRAY.text }}>{formatHM(v)}</Text>
+          </View>
+          <View style={{ height:10, backgroundColor:'#F3F4F6', borderRadius:999, overflow:'hidden' }}>
+            <View style={{ width:`${(v/safeMax)*100}%`, height:'100%', backgroundColor:'#3B82F6' }}/>
+          </View>
+        </View>
+      ))}
+    </View>
+  );
+}
+
+function SplitBar({ leftPct, leftLabel, rightLabel }:{ leftPct:number; leftLabel:string; rightLabel:string }) {
+  const lp = Math.max(0, Math.min(100, leftPct));
+  const rp = 100 - lp;
+  return (
+    <View style={{ marginTop:8 }}>
+      <View style={{ height:14, backgroundColor:'#F3F4F6', borderRadius:999, overflow:'hidden', flexDirection:'row' }}>
+        <View style={{ width:`${lp}%`, backgroundColor:'#10B981' }}/>
+        <View style={{ width:`${rp}%`, backgroundColor:'#3B82F6' }}/>
+      </View>
+      <View style={{ flexDirection:'row', justifyContent:'space-between', marginTop:6 }}>
+        <Text style={{ fontSize:12, color:'#065F46' }}>{leftLabel} {lp}%</Text>
+        <Text style={{ fontSize:12, color:'#1E3A8A' }}>{rightLabel} {rp}%</Text>
+      </View>
+    </View>
+  );
+}
+
+function MonthlyBars({ items, max }:{ items:{label:string; min:number}[]; max:number }) {
+  const safeMax = Math.max(1, max);
+  return (
+    <View style={{ flexDirection:'row', alignItems:'flex-end', gap:10 }}>
+      {items.map((it, idx)=>(
+        <View key={idx} style={{ alignItems:'center', flex:1 }}>
+          <View style={{
+            width:18,
+            height: Math.max(6, Math.round((it.min/safeMax)*70)),
+            backgroundColor:'#10B981',
+            borderRadius:6,
+          }}/>
+          <Text style={{ marginTop:6, fontSize:11, color: GRAY.text }}>{it.label}</Text>
+          <Text style={{ marginTop:2, fontSize:11, fontWeight:'700' }}>{formatHM(it.min)}</Text>
+        </View>
+      ))}
+    </View>
+  );
+}
+
+/* ===== Calendar parts (원본 그대로) ===== */
+function WeekHeader() {
+  const COLS = 7, GAP = 8, H_PAD = 20;
+  const width = (SCREEN_W - H_PAD*2 - GAP*6) / COLS;
+  const names = ['월','화','수','목','금','토','일'];
+  return (
+    <View style={{ flexDirection:'row', justifyContent:'space-between', marginTop:6, marginBottom:6 }}>
+      {names.map(w=>(
+        <View key={w} style={{ alignItems:'center', width }}>
+          <Text style={{ color: GRAY.text, fontSize:12 }}>{w}</Text>
+        </View>
+      ))}
+    </View>
+  );
+}
+
+function CalendarGrid({
+  year, month0, firstWd, dailyTotals, onPressDay, onLongPressDay
+}: {
+  year:number; month0:number; firstWd:number;
+  dailyTotals: Record<string, number>;
+  onPressDay: (d:Date)=>void;
+  onLongPressDay: (d:Date)=>void;
+}) {
+  const COLS = 7, GAP = 8, H_PAD = 20;
+  const CELL = (SCREEN_W - H_PAD*2 - GAP*6) / COLS;
+
+  return (
+    <View style={{ flexDirection:'row', flexWrap:'wrap' }}>
+      {Array.from({length:firstWd}).map((_,i)=>(
+        <View key={`empty-${i}`} style={{ width:CELL, height:CELL, marginRight:(i%COLS)===COLS-1?0:GAP, marginBottom:GAP }} />
+      ))}
+      {Array.from({length:getDaysInMonth(year,month0)},(_,i)=>i+1).map((day,i)=>{
+        const col = (firstWd + i) % COLS;
+        const d = new Date(year, month0, day);
+        const key = ymdKey(d);
+        const total = dailyTotals[key] || 0;
+        const bg = minutesToColor(total);
+        return (
+          <TouchableOpacity
+            key={day}
+            onPress={()=>onPressDay(d)}
+            onLongPress={()=>onLongPressDay(d)}
+            delayLongPress={220}
+            style={{
+              width:CELL, height:CELL,
+              marginRight: col===COLS-1 ? 0 : GAP, marginBottom:GAP,
+              borderRadius: CELL/2,
+              borderWidth: bg?0:1, borderColor: GRAY.ring,
+              backgroundColor: bg || '#fff',
+              alignItems:'center', justifyContent:'center',
+            }}>
+            <Text style={{ fontWeight:'700', fontSize:13, color: bg?'#fff':'#111827' }}>{day}</Text>
+          </TouchableOpacity>
+        );
+      })}
+    </View>
+  );
+}
+
+function Legend({ legendOpen, setLegendOpen }:{ legendOpen:boolean; setLegendOpen:(f:(b:boolean)=>boolean)=>void }) {
+  return (
+    <View style={{ marginTop:10, backgroundColor:'#fff', borderRadius:12, borderWidth:1, borderColor:'#E5E7EB' }}>
+      <TouchableOpacity
+        onPress={()=>setLegendOpen(o=>!o)}
+        style={{ paddingVertical:12, paddingHorizontal:12, flexDirection:'row', alignItems:'center', justifyContent:'space-between' }}
+        activeOpacity={0.7}
+      >
+        <Text style={{ fontSize:14, fontWeight:'800' }}>범례</Text>
+        <Text style={{ fontSize:16, color: GRAY.text }}>{legendOpen ? '▾' : '▸'}</Text>
+      </TouchableOpacity>
+
+      {legendOpen && (
+        <View style={{ paddingHorizontal:12, paddingBottom:12 }}>
+          {[
+            { label:'10시간 이상', color:GREEN.g6 },
+            { label:'8–9시간',   color:GREEN.g5 },
+            { label:'6–7시간',   color:GREEN.g4 },
+            { label:'4–5시간',   color:GREEN.g3 },
+            { label:'2–3시간',   color:GREEN.g2 },
+            { label:'1시간',     color:GREEN.g1 },
+            { label:'1시간 미만', color:'rgba(16,185,129,0.15)' },
+            { label:'기록 없음', color:'transparent', ring:true },
+          ].map((it,idx)=>(
+            <View key={idx} style={{ flexDirection:'row', alignItems:'center', marginBottom:6 }}>
+              <View style={{
+                width:16, height:16, borderRadius:8, marginRight:8,
+                backgroundColor: it.color==='transparent' ? '#fff' : it.color,
+                borderWidth: it.ring?1:0, borderColor: GRAY.ring,
+              }}/>
+              <Text>{it.label}</Text>
+            </View>
+          ))}
+        </View>
+      )}
+    </View>
+  );
+}
+
+function SheetHandle() {
+  return (
+    <View style={{ alignItems:'center', paddingTop:8 }}>
+      <View style={{ width:36, height:5, borderRadius:999, backgroundColor: GRAY.light }} />
+    </View>
+  );
+}
+

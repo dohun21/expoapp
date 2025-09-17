@@ -1,11 +1,12 @@
 // app/routine/run.tsx
-import { Picker } from '@react-native-picker/picker';
 import { useLocalSearchParams, useRouter } from 'expo-router';
 import { onAuthStateChanged } from 'firebase/auth';
 import { addDoc, collection, serverTimestamp } from 'firebase/firestore';
-import { useEffect, useState } from 'react';
+import React, { useEffect, useMemo, useState } from 'react';
 import { Alert, Platform, ScrollView, Text, TouchableOpacity, View } from 'react-native';
 import { auth, db } from '../../firebaseConfig';
+
+type StepItem = { step: string; minutes: number };
 
 export default function RoutineRunScreen() {
   const router = useRouter();
@@ -13,7 +14,7 @@ export default function RoutineRunScreen() {
   const { title, steps } = useLocalSearchParams();
   const routineTitle = typeof title === 'string' ? title : '루틴';
   const stepsRaw = typeof steps === 'string' ? steps : '';
-  const stepList = stepsRaw
+  const stepList: StepItem[] = stepsRaw
     .split('|')
     .map((s) => s.trim())
     .filter(Boolean)
@@ -28,9 +29,6 @@ export default function RoutineRunScreen() {
   const [isFinished, setIsFinished] = useState(false);
   const [uid, setUid] = useState<string | null>(null);
   const [isSaved, setIsSaved] = useState(false);
-
-  const [setCount, setSetCount] = useState(1);
-  const [currentSet, setCurrentSet] = useState(1);
   const [isStarted, setIsStarted] = useState(false);
 
   /* ---------- auth ---------- */
@@ -39,42 +37,57 @@ export default function RoutineRunScreen() {
     return () => unsub();
   }, []);
 
+  /* ---------- memoized totals ---------- */
+  const totalSeconds = useMemo(
+    () => stepList.reduce((acc, s) => acc + Math.max(0, s.minutes) * 60, 0),
+    [stepList]
+  );
+  const currentStepTotalSec = (stepList[stepIndex]?.minutes || 0) * 60;
+
+  const completedSeconds = useMemo(() => {
+    const prevSec = stepList.slice(0, stepIndex).reduce((acc, s) => acc + Math.max(0, s.minutes) * 60, 0);
+    const curDone = Math.max(0, currentStepTotalSec - remainingTime);
+    return Math.min(totalSeconds, prevSec + curDone);
+  }, [stepList, stepIndex, remainingTime, currentStepTotalSec, totalSeconds]);
+
+  const progress = totalSeconds > 0 ? completedSeconds / totalSeconds : 0;
+
   /* ---------- timer ---------- */
   useEffect(() => {
     if (!isRunning || isFinished || !isStarted) return;
 
     if (remainingTime <= 0) {
-      // 다음 스텝으로
+      // 다음 스텝 또는 종료
       if (stepIndex + 1 < stepList.length) {
         const nextStep = stepList[stepIndex + 1];
         setStepIndex((i) => i + 1);
         setRemainingTime((nextStep?.minutes || 0) * 60);
       } else {
-        // 다음 세트 or 종료
-        if (currentSet < setCount) {
-          setCurrentSet((s) => s + 1);
-          setStepIndex(0);
-          setRemainingTime((stepList[0]?.minutes || 0) * 60);
-        } else {
-          setIsFinished(true);
-          setIsRunning(false);
-        }
+        setIsFinished(true);
+        setIsRunning(false);
       }
       return;
     }
 
     const timer = setInterval(() => setRemainingTime((prev) => prev - 1), 1000);
     return () => clearInterval(timer);
-    // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [remainingTime, isRunning, isFinished, isStarted, stepIndex, currentSet, setCount]);
+  }, [remainingTime, isRunning, isFinished, isStarted, stepIndex, stepList]);
 
   /* ---------- utils ---------- */
-  const formatTime = (s: number) => {
+  const formatMMSS = (s: number) => {
     const m = Math.floor(s / 60);
     const sec = s % 60;
     const mm = String(Math.max(0, m)).padStart(2, '0');
     const ss = String(Math.max(0, sec)).padStart(2, '0');
     return `${mm}:${ss}`;
+  };
+
+  const formatHM = (sec: number) => {
+    const h = Math.floor(sec / 3600);
+    const m = Math.ceil((sec % 3600) / 60);
+    if (h > 0 && m > 0) return `${h}시간 ${m}분`;
+    if (h > 0) return `${h}시간`;
+    return `${m}분`;
   };
 
   const saveRoutineRecord = async () => {
@@ -87,7 +100,6 @@ export default function RoutineRunScreen() {
         uid,
         title: routineTitle,
         steps: stepList,
-        setCount,
         completedAt: serverTimestamp(),
       });
       setIsSaved(true);
@@ -98,22 +110,15 @@ export default function RoutineRunScreen() {
 
   /* ---------- UI ---------- */
   const TOP_SPACING = Platform.OS === 'android' ? 24 : 44;
-
-  // 스텝이 없을 때 가드
   const hasSteps = stepList.length > 0;
+  const nextStep = stepList[stepIndex + 1];
 
   return (
-    <ScrollView
-      style={{ flex: 1, backgroundColor: '#FFFFFF' }}
-      contentContainerStyle={{ paddingBottom: 40 }}
-    >
+    <ScrollView style={{ flex: 1, backgroundColor: '#FFFFFF' }} contentContainerStyle={{ paddingBottom: 40 }}>
       {/* Header */}
       <View style={{ paddingTop: TOP_SPACING, paddingHorizontal: 20, paddingBottom: 6 }}>
         <View style={{ flexDirection: 'row', alignItems: 'center' }}>
-          <TouchableOpacity
-            onPress={() => router.back()}
-            style={{ padding: 8, marginRight: 6, borderRadius: 10 }}
-          >
+          <TouchableOpacity onPress={() => router.back()} style={{ padding: 8, marginRight: 6, borderRadius: 10 }}>
             <Text style={{ fontSize: 18, marginTop: 20 }}>〈</Text>
           </TouchableOpacity>
           <Text style={{ fontSize: 18, fontWeight: '800', marginTop: 20 }}>{routineTitle}</Text>
@@ -124,61 +129,53 @@ export default function RoutineRunScreen() {
         {!isFinished ? (
           !isStarted ? (
             <>
-              {/* 시작 섹션 */}
-              <View style={{ marginTop: 30, marginBottom: 24 }}>
+              {/* 소개 섹션 */}
+              <View style={{ marginTop: 30, marginBottom: 14 }}>
                 <Text style={{ fontSize: 22, fontWeight: '800', color: '#111827', marginBottom: 10 }}>
                   {routineTitle} 시작하기
                 </Text>
-                
-              </View>
-
-              {/* 세트 선택 카드 */}
-              <View
-                style={{
-                  backgroundColor: '#F9FAFB',
-                  borderWidth: 1,
-                  borderColor: '#E5E7EB',
-                  borderRadius: 14,
-                  paddingVertical: 10,
-                  paddingHorizontal: 12,
-                  marginBottom: 30,
-                }}
-              >
-                <View style={{ flexDirection: 'row', alignItems: 'center', justifyContent: 'space-between' }}>
-                  <Text style={{ fontSize: 14, color: '#374151', fontWeight: '700' }}>반복할 횟수</Text>
-
-                  {/* ✅ 색 입힌 세트 선택 박스 */}
-                  <View
-                    style={{
-                      width: 160,
-                      borderWidth: 1,
-                      borderColor: '#93C5FD',
-                      borderRadius: 12,
-                      overflow: 'hidden',
-                      backgroundColor: '#DBEAFE', // 파랑 톤 배경
-                    }}
-                  >
-                    <Picker
-                      selectedValue={setCount}
-                      onValueChange={(val: number | string) => setSetCount(Number(val))}
-                      style={{
-                        height: 44,
-                        width: '100%',
-                        backgroundColor: '#DBEAFE',
-                        color: '#1E40AF', // 텍스트 컬러(안드로이드)
-                        paddingHorizontal: 8,
-                      }}
-                      itemStyle={{
-                        color: '#1E40AF', // 텍스트 컬러(iOS)
-                        fontSize: 14,
-                      }}
-                      dropdownIconColor="#1D4ED8" // 드롭다운 아이콘 컬러(안드로이드)
-                    >
-                      {[1, 2, 3, 4, 5].map((n) => (
-                        <Picker.Item key={n} label={`${n}세트`} value={n} />
+                {/* 스텝 요약 카드: 이 루틴이 무엇을 하는지 */}
+                <View
+                  style={{
+                    backgroundColor: '#F9FAFB',
+                    borderWidth: 1,
+                    borderColor: '#E5E7EB',
+                    borderRadius: 14,
+                    paddingVertical: 14,
+                    paddingHorizontal: 14,
+                  }}
+                >
+                  
+                  {!hasSteps ? (
+                    <Text style={{ color: '#EF4444' }}>스텝이 없습니다. 루틴 편집에서 스텝을 추가해주세요.</Text>
+                  ) : (
+                    <View>
+                      {stepList.map((st, idx) => (
+                        <View
+                          key={`${idx}-${st.step}`}
+                          style={{
+                            flexDirection: 'row',
+                            alignItems: 'center',
+                            justifyContent: 'space-between',
+                            paddingVertical: 6,
+                            borderBottomWidth: idx === stepList.length - 1 ? 0 : 1,
+                            borderColor: '#F3F4F6',
+                          }}
+                        >
+                          <Text style={{ fontSize: 14, color: '#111827' }}>
+                            {idx + 1}. {st.step}
+                          </Text>
+                          <Text style={{ fontSize: 13, color: '#6B7280' }}>{st.minutes}분</Text>
+                        </View>
                       ))}
-                    </Picker>
-                  </View>
+                      <View style={{ marginTop: 10, flexDirection: 'row', justifyContent: 'space-between' }}>
+                        <Text style={{ fontSize: 13, color: '#6B7280' }}> 총 시간</Text>
+                        <Text style={{ fontSize: 14, fontWeight: '700', color: '#1F2937' }}>
+                          {formatHM(totalSeconds)}
+                        </Text>
+                      </View>
+                    </View>
+                  )}
                 </View>
               </View>
 
@@ -197,56 +194,123 @@ export default function RoutineRunScreen() {
                   marginTop: 10,
                 }}
               >
-                <Text style={{ color: '#fff', fontSize: 16, fontWeight: '700' }}>
-                  ▶ 루틴 시작하기
-                </Text>
+                <Text style={{ color: '#fff', fontSize: 16, fontWeight: '700' }}>▶ 루틴 시작하기</Text>
               </TouchableOpacity>
 
-              {!hasSteps && (
-                <Text style={{ marginTop: 10, color: '#EF4444' }}>
-                  스텝이 없습니다. 루틴 편집에서 스텝을 추가해주세요.
-                </Text>
-              )}
-
-              {/* 뒤로가기 */}
-              <TouchableOpacity
-                onPress={() => router.back()}
-                style={{ alignSelf: 'center', paddingVertical: 14, paddingHorizontal: 18, marginTop: 18 }}
-              >
-                <Text style={{ color: '#6B7280' }}>뒤로가기</Text>
-              </TouchableOpacity>
+             
             </>
           ) : (
             <>
-              {/* 실행 중 */}
+              {/* 실행 중 헤더 */}
               <View style={{ marginTop: 10, marginBottom: 12 }}>
-                <Text style={{ fontSize: 22, fontWeight: '800', color: '#111827' }}>
-                  {routineTitle} 실행 중
-                </Text>
+                <Text style={{ fontSize: 22, fontWeight: '800', color: '#111827' }}>{routineTitle} 실행 중</Text>
                 <Text style={{ fontSize: 13, color: '#6B7280', marginTop: 6 }}>
-                  ({currentSet}세트 / 총 {setCount}세트)
+                  스텝 {stepIndex + 1} / {stepList.length}
+                  {nextStep ? `  ·  다음: ${nextStep.step} (${nextStep.minutes}분)` : ''}
                 </Text>
               </View>
 
+              {/* 전체 진행률 바 */}
+              <View style={{ marginBottom: 14 }}>
+                <View
+                  style={{
+                    height: 10,
+                    borderRadius: 999,
+                    backgroundColor: '#E5E7EB',
+                    overflow: 'hidden',
+                  }}
+                >
+                  <View
+                    style={{
+                      width: `${Math.round(progress * 100)}%`,
+                      height: '100%',
+                      backgroundColor: '#60A5FA',
+                    }}
+                  />
+                </View>
+                <Text style={{ marginTop: 6, fontSize: 12, color: '#6B7280' }}>
+                  전체 진행률 {Math.round(progress * 100)}% · 남은 시간 {formatHM(totalSeconds - completedSeconds)}
+                </Text>
+              </View>
+
+              {/* 현재 단계 카드 */}
               <View
                 style={{
                   backgroundColor: '#EFF6FF',
                   borderRadius: 16,
                   padding: 22,
                   marginTop: 8,
-                  marginBottom: 28,
+                  marginBottom: 18,
                   alignItems: 'center',
                   borderWidth: 1,
                   borderColor: '#DBEAFE',
                 }}
               >
                 <Text style={{ fontSize: 12, color: '#6B7280', marginBottom: 8 }}>현재 단계</Text>
-                <Text style={{ fontSize: 20, fontWeight: '700', marginBottom: 10, color: '#1F2937', textAlign: 'center' }}>
+                <Text
+                  style={{
+                    fontSize: 20,
+                    fontWeight: '700',
+                    marginBottom: 10,
+                    color: '#1F2937',
+                    textAlign: 'center',
+                  }}
+                >
                   {stepList[stepIndex]?.step ?? '—'}
                 </Text>
                 <Text style={{ fontSize: 44, fontWeight: '800', color: '#1D4ED8', letterSpacing: 1 }}>
-                  {formatTime(remainingTime)}
+                  {formatMMSS(remainingTime)}
                 </Text>
+              </View>
+
+              {/* 스텝 목록 (현재 단계 표시) */}
+              <View
+                style={{
+                  backgroundColor: '#F9FAFB',
+                  borderWidth: 1,
+                  borderColor: '#E5E7EB',
+                  borderRadius: 14,
+                  paddingVertical: 10,
+                  paddingHorizontal: 12,
+                  marginBottom: 16,
+                }}
+              >
+                <Text style={{ fontSize: 13, color: '#6B7280', marginBottom: 6 }}>스텝 목록</Text>
+                {stepList.map((st, idx) => {
+                  const active = idx === stepIndex;
+                  return (
+                    <View
+                      key={`${idx}-${st.step}`}
+                      style={{
+                        flexDirection: 'row',
+                        alignItems: 'center',
+                        justifyContent: 'space-between',
+                        paddingVertical: 6,
+                        borderBottomWidth: idx === stepList.length - 1 ? 0 : 1,
+                        borderColor: '#F3F4F6',
+                      }}
+                    >
+                      <Text
+                        style={{
+                          fontSize: 14,
+                          color: active ? '#1F2937' : '#374151',
+                          fontWeight: active ? '800' : '400',
+                        }}
+                      >
+                        {idx + 1}. {st.step}
+                      </Text>
+                      <Text
+                        style={{
+                          fontSize: 12,
+                          color: active ? '#1D4ED8' : '#6B7280',
+                          fontWeight: active ? '700' : '400',
+                        }}
+                      >
+                        {st.minutes}분
+                      </Text>
+                    </View>
+                  );
+                })}
               </View>
 
               {/* 컨트롤 버튼들 */}
@@ -268,21 +332,13 @@ export default function RoutineRunScreen() {
 
                 <TouchableOpacity
                   onPress={() => {
-                    // 스킵(다음 단계로)
                     if (stepIndex + 1 < stepList.length) {
-                      const nextStep = stepList[stepIndex + 1];
+                      const next = stepList[stepIndex + 1];
                       setStepIndex((i) => i + 1);
-                      setRemainingTime((nextStep?.minutes || 0) * 60);
+                      setRemainingTime((next?.minutes || 0) * 60);
                     } else {
-                      // 마지막이면 세트 증가 또는 종료
-                      if (currentSet < setCount) {
-                        setCurrentSet((s) => s + 1);
-                        setStepIndex(0);
-                        setRemainingTime((stepList[0]?.minutes || 0) * 60);
-                      } else {
-                        setIsFinished(true);
-                        setIsRunning(false);
-                      }
+                      setIsFinished(true);
+                      setIsRunning(false);
                     }
                   }}
                   style={{
@@ -310,15 +366,46 @@ export default function RoutineRunScreen() {
         ) : (
           // 완료 화면
           <View style={{ marginTop: 24, alignItems: 'center' }}>
-            <Text style={{ fontSize: 22, fontWeight: '800', color: '#059669', marginBottom: 8 }}>
-               루틴 완료!
-            </Text>
-            <Text style={{ fontSize: 14, color: '#374151', marginBottom: 22 }}>
-              총 {setCount}세트를 완주했어요! 대단해요 
+            <Text style={{ fontSize: 22, fontWeight: '800', color: '#059669', marginBottom: 8 }}>루틴 완료!</Text>
+            <Text style={{ fontSize: 14, color: '#374151', marginBottom: 12 }}>
+              총 {stepList.length}단계를 모두 마쳤어요! ({formatHM(totalSeconds)})
             </Text>
 
+            {/* 이번에 한 일 요약 */}
+            <View
+              style={{
+                backgroundColor: '#F0FDF4',
+                borderWidth: 1,
+                borderColor: '#BBF7D0',
+                borderRadius: 14,
+                paddingVertical: 12,
+                paddingHorizontal: 14,
+                width: '100%',
+                maxWidth: 520,
+              }}
+            >
+              {stepList.map((st, idx) => (
+                <View
+                  key={`${idx}-${st.step}`}
+                  style={{
+                    flexDirection: 'row',
+                    alignItems: 'center',
+                    justifyContent: 'space-between',
+                    paddingVertical: 6,
+                    borderBottomWidth: idx === stepList.length - 1 ? 0 : 1,
+                    borderColor: '#DCFCE7',
+                  }}
+                >
+                  <Text style={{ fontSize: 14, color: '#065F46' }}>
+                    {idx + 1}. {st.step}
+                  </Text>
+                  <Text style={{ fontSize: 13, color: '#047857' }}>{st.minutes}분</Text>
+                </View>
+              ))}
+            </View>
+
             {isSaved ? (
-              <Text style={{ fontSize: 14, color: '#10B981', fontWeight: '700', marginBottom: 12 }}>
+              <Text style={{ fontSize: 14, color: '#10B981', fontWeight: '700', marginTop: 12 }}>
                 ✅ 기록이 저장되었습니다!
               </Text>
             ) : (
@@ -331,18 +418,14 @@ export default function RoutineRunScreen() {
                   borderRadius: 16,
                   alignItems: 'center',
                   minWidth: 200,
+                  marginTop: 16,
                 }}
               >
-                <Text style={{ color: '#fff', fontSize: 15, fontWeight: '700' }}>
-                  기록 저장하기
-                </Text>
+                <Text style={{ color: '#fff', fontSize: 15, fontWeight: '700' }}>기록 저장하기</Text>
               </TouchableOpacity>
             )}
 
-            <TouchableOpacity
-              onPress={() => router.back()}
-              style={{ paddingVertical: 14, paddingHorizontal: 18, marginTop: 16 }}
-            >
+            <TouchableOpacity onPress={() => router.back()} style={{ paddingVertical: 14, paddingHorizontal: 18, marginTop: 16 }}>
               <Text style={{ color: '#6B7280' }}>뒤로가기</Text>
             </TouchableOpacity>
           </View>

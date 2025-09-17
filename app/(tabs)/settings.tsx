@@ -289,9 +289,9 @@ export default function SettingsPage() {
           style={{
             fontSize: 24,
             fontWeight: 'bold',
-            color: '#059669',
-            marginBottom: 20,
-            marginTop: 50,
+            color: '#0000000',
+            marginBottom: 50,
+            marginTop: 70,
             marginLeft: 10,
           }}
         >
@@ -299,20 +299,7 @@ export default function SettingsPage() {
         </Text>
 
         {/* 탭 */}
-        <View style={{ width: '100%', alignItems: 'center', marginBottom: 8, marginTop: 10 }}>
-          <View style={{ flexDirection: 'row', alignItems: 'flex-end', justifyContent: 'center', gap: 100 }}>
-            <View style={{ alignItems: 'center' }}>
-              <Text style={{ fontSize: 16, fontWeight: 'bold', color: '#059669', paddingBottom: 4 }}>내정보</Text>
-              <View style={{ height: 2, backgroundColor: '#059669', width: 40 }} />
-            </View>
-            <TouchableOpacity onPress={() => router.push('/rewards')}>
-              <View style={{ alignItems: 'center' }}>
-                <Text style={{ fontSize: 16, fontWeight: 'bold', color: '#D1D5DB', paddingBottom: 4 }}>배지/스탬프</Text>
-                <View style={{ height: 2, backgroundColor: 'transparent', width: 40 }} />
-              </View>
-            </TouchableOpacity>
-          </View>
-        </View>
+       
 
         <View style={{ width: '100%', height: 1, backgroundColor: '#E5E7EB', marginBottom: 20 }} />
 
@@ -364,7 +351,7 @@ export default function SettingsPage() {
             marginBottom: 20
           }}
         >
-          <SettingItem label="🔒 비밀번호 변경" onPress={handleChangePassword} />
+          <SettingItem label=" 비밀번호 변경" onPress={handleChangePassword} />
           <Divider />
           
         

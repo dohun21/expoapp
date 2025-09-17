@@ -1,4 +1,3 @@
-// app/session/routinePlayer.tsx
 import AsyncStorage from '@react-native-async-storage/async-storage';
 import { useLocalSearchParams, useRouter } from 'expo-router';
 import React, { useEffect, useMemo, useRef, useState } from 'react';
@@ -130,6 +129,29 @@ export default function RoutinePlayer() {
     } as any);
   }
 
+  // ⭐ 임시저장 후 나가기: 경과시간만 저장하고 홈으로 복귀(큐 이어가기 X)
+  async function saveDraftAndExit() {
+    stopTimer();
+    const total = Math.max(0, elapsedRef.current); // 진행분만 저장
+    const timeStr = formatStudyTime(total);
+
+    await AsyncStorage.setItem('subject', String(subject || '기타'));
+    await AsyncStorage.setItem('content', String(content || ''));
+    await AsyncStorage.setItem('studyTime', timeStr);
+    await AsyncStorage.setItem('memo', routineTitle ? `[임시저장] ${routineTitle} 진행 중` : '[임시저장] 진행 중');
+
+    router.replace({
+      pathname: '/session/summary',
+      params: {
+        backTo: '/home',
+        donePlanId: '',
+        queue: '',
+        mode: 'routine',
+        pause: '1', // 요약 화면에서 홈으로
+      },
+    } as any);
+  }
+
   if (!steps.length || !routineTitle) {
     return (
       <View style={[styles.page, { justifyContent: 'center', alignItems: 'center' }]}>
@@ -143,7 +165,7 @@ export default function RoutinePlayer() {
 
   const current = steps[stepIdx];
 
-  // 진행률 계산
+  // 진행률
   const stepProgress = totalSteps > 0 ? (stepIdx + 1) / totalSteps : 0;
   const setProgress = (setIdx + 1) / Math.max(1, setCount);
 
@@ -156,12 +178,12 @@ export default function RoutinePlayer() {
         <View style={styles.card}>
           <View style={styles.badgeRow}>
             <Text style={[styles.badge, styles.badgeGray]}>{subject || '기타'}</Text>
-            <Text style={[styles.badge, styles.badgeBlue]}>세트 {setIdx + 1}/{setCount}</Text>
+      
           </View>
           <Text style={styles.cardTitle}>{routineTitle}</Text>
           {!!content && <Text style={styles.metaDim}>내용: {content}</Text>}
 
-          {/* 스텝 간단 목록 */}
+          {/* 스텝 목록(간단) */}
           <View style={styles.stepList}>
             {steps.map((s, i) => (
               <Text key={i} style={styles.stepChip}>• {s.step} ({s.minutes}분)</Text>
@@ -171,8 +193,8 @@ export default function RoutinePlayer() {
 
         {/* 진행 바(프리뷰) */}
         <View style={styles.progressBlock}>
-          <Text style={styles.progressLabel}>세트 진행</Text>
-          <View style={styles.progressBar}><View style={[styles.progressFill, { width: `${Math.round(setProgress * 100)}%` }]} /></View>
+         
+
           <Text style={styles.progressLabel}>스텝 진행</Text>
           <View style={styles.progressBar}><View style={[styles.progressFillBlue, { width: `${Math.round(stepProgress * 100)}%` }]} /></View>
         </View>
@@ -192,21 +214,20 @@ export default function RoutinePlayer() {
       <View style={styles.card}>
         <View style={styles.badgeRow}>
           <Text style={[styles.badge, styles.badgeGray]}>{subject || '기타'}</Text>
-          <Text style={[styles.badge, styles.badgeBlue]}>세트 {setIdx + 1}/{setCount}</Text>
+          
         </View>
         <Text style={styles.cardTitle}>{routineTitle}</Text>
         {!!content && <Text style={styles.metaDim}>내용: {content}</Text>}
 
         {/* 진행 바 */}
         <View style={styles.progressBlock}>
-          <Text style={styles.progressLabel}>세트 진행</Text>
-          <View style={styles.progressBar}><View style={[styles.progressFill, { width: `${Math.round(setProgress * 100)}%` }]} /></View>
+         
           <Text style={styles.progressLabel}>스텝 진행</Text>
           <View style={styles.progressBar}><View style={[styles.progressFillBlue, { width: `${Math.round(stepProgress * 100)}%` }]} /></View>
         </View>
       </View>
 
-      {/* 현재 스텝 박스 */}
+      {/* 현재 스텝 */}
       <View style={styles.nowBox}>
         <Text style={styles.nowLabel}>지금 할 일</Text>
         <Text style={styles.nowTitle} numberOfLines={2}>{current.step}</Text>
@@ -220,11 +241,16 @@ export default function RoutinePlayer() {
             <Text style={styles.btnText}>{isLastStepInSet && isLastSet ? '마치기' : '다음'}</Text>
           </TouchableOpacity>
         </View>
+
+        {/* ⭐ 임시저장 후 나가기 */}
+        <TouchableOpacity onPress={saveDraftAndExit} style={[styles.btn, styles.gray, { marginTop: 8 }]}>
+          <Text style={styles.btnText}>임시저장 후 나가기</Text>
+        </TouchableOpacity>
       </View>
 
       {/* 스텝 목록 하이라이트 */}
       <View style={styles.stepsCard}>
-        <Text style={styles.stepsHeader}>이번 세트 스텝</Text>
+        <Text style={styles.stepsHeader}>이번 스텝</Text>
         <ScrollView horizontal showsHorizontalScrollIndicator={false} contentContainerStyle={{ paddingVertical: 4 }}>
           {steps.map((s, i) => {
             const active = i === stepIdx;
@@ -281,7 +307,7 @@ const styles = StyleSheet.create({
   progressLabel: { fontSize: 11, color: '#6B7280', marginTop: 6, marginBottom: 4, fontWeight: '700' },
   progressBar: { height: 10, backgroundColor: '#E5E7EB', borderRadius: 999, overflow: 'hidden' },
   progressFill: { height: '100%', backgroundColor: '#10B981' },
-  progressFillBlue: { height: '100%', backgroundColor: '#3B82F6' },
+  progressFillBlue: { height: '100%', backgroundColor: '#2563EB' },
 
   /* 준비 버튼 */
   readyBtn: { height: 48, borderRadius: 14, alignItems: 'center', justifyContent: 'center', backgroundColor: '#3B82F6', marginTop: 14 },
@@ -297,6 +323,7 @@ const styles = StyleSheet.create({
   btn: { flex: 1, height: 48, borderRadius: 12, alignItems: 'center', justifyContent: 'center' },
   primary: { backgroundColor: '#059669' },
   blue: { backgroundColor: '#2563EB' },
+  gray: { backgroundColor: '#6B7280' },
   btnText: { color: '#fff', fontWeight: '800', fontSize: 15 },
 
   /* 스텝 목록 하이라이트 */
@@ -310,28 +337,13 @@ const styles = StyleSheet.create({
     borderColor: '#E5E7EB',
   },
   stepsHeader: { fontSize: 12, color: '#374151', fontWeight: '700', marginBottom: 6 },
-  stepPill: {
-    paddingHorizontal: 10,
-    paddingVertical: 6,
-    backgroundColor: '#E5E7EB',
-    borderRadius: 999,
-    marginRight: 8,
-  },
-  stepPillActive: {
-    backgroundColor: '#1D4ED8',
-  },
+  stepPill: { paddingHorizontal: 10, paddingVertical: 6, backgroundColor: '#E5E7EB', borderRadius: 999, marginRight: 8 },
+  stepPillActive: { backgroundColor: '#1D4ED8' },
   stepPillText: { fontSize: 12, color: '#374151', fontWeight: '800' },
   stepPillTextActive: { color: '#FFFFFF' },
 
   /* 다음 미리보기 */
-  preview: {
-    marginTop: 12,
-    backgroundColor: '#F5F5F5',
-    borderRadius: 12,
-    padding: 12,
-    borderWidth: 1,
-    borderColor: '#E5E7EB',
-  },
+  preview: { marginTop: 12, backgroundColor: '#F5F5F5', borderRadius: 12, padding: 12, borderWidth: 1, borderColor: '#E5E7EB' },
   previewTitle: { fontSize: 12, fontWeight: '700', color: '#374151' },
   previewText: { fontSize: 14, marginTop: 6, color: '#111' },
 
