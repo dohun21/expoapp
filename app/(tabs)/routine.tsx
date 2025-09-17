@@ -1,6 +1,6 @@
 import { Ionicons } from '@expo/vector-icons';
 import AsyncStorage from '@react-native-async-storage/async-storage';
-import { useRouter } from 'expo-router';
+import { useLocalSearchParams, useRouter } from 'expo-router';
 import React, { useEffect, useMemo, useRef, useState } from 'react';
 import {
   Alert,
@@ -26,94 +26,115 @@ const STORAGE_KEY = '@userRoutinesV1';
 const FAV_KEY = '@favoriteRoutineIdsV1';         // v1: string[], v2: Record<id, favoriteAt>
 const RUN_KEY = '@routineRunStatsV1';            // { [id]: { runCount: number, lastRunAt: number } }
 
-// ✅ 기본 제공 루틴
+// ✅ 허용 태그(4개 고정)
+const ALLOWED_TAGS = ['#개념이해', '#문제풀이', '#암기', '#복습정리'] as const;
+type AllowedTag = typeof ALLOWED_TAGS[number];
+
+// ✅ 기본 제공 루틴 (태그 4개만 사용하도록 정리)
 const PRESET_ROUTINES: Routine[] = [
-  { id: 'preset-2', title: '영단어 암기 루틴', steps: [
+  { id: 'preset-2',  title: '영단어 암기 루틴', steps: [
     { step: '영단어 외우기', minutes: 20 },
     { step: '예문 만들기', minutes: 15 },
     { step: '퀴즈 테스트 해보기 1분', minutes: 10 },
-  ], tags: ['#암기', '#영어'], origin: 'preset' },
-  { id: 'preset-3', title: '오답 집중 루틴', steps: [
+  ], tags: ['#암기'], origin: 'preset' },
+
+  { id: 'preset-3',  title: '오답 집중 루틴', steps: [
     { step: '최근 오답 복습', minutes: 20 },
     { step: '비슷한 유형 문제 다시 풀기', minutes: 25 },
     { step: '정답/오답 비교 정리', minutes: 15 },
   ], tags: ['#문제풀이', '#복습정리'], origin: 'preset' },
-  { id: 'preset-4', title: '시험 전날 총정리 루틴', steps: [
+
+  { id: 'preset-4',  title: '시험 전날 총정리 루틴', steps: [
     { step: '전체 범위 핵심 정리', minutes: 40 },
     { step: '예상 문제 풀기', minutes: 30 },
     { step: '오답 노트 만들기', minutes: 20 },
-  ], tags: ['#시험준비', '#복습정리'], origin: 'preset' },
-  { id: 'preset-5', title: '내가 만든 문제 루틴', steps: [
+  ], tags: ['#복습정리'], origin: 'preset' },
+
+  { id: 'preset-5',  title: '내가 만든 문제 루틴', steps: [
     { step: '중요 개념 1개 고르기', minutes: 5 },
     { step: '문제 만들기', minutes: 10 },
     { step: '직접 풀고 해설 달기', minutes: 15 },
   ], tags: ['#개념이해'], origin: 'preset' },
-  { id: 'preset-6', title: '수학 서술형 루틴', steps: [
+
+  { id: 'preset-6',  title: '수학 서술형 루틴', steps: [
     { step: '서술형 문제 3개 풀기', minutes: 20 },
     { step: '풀이 과정 점검', minutes: 10 },
     { step: '모범답안과 비교', minutes: 10 },
   ], tags: ['#문제풀이'], origin: 'preset' },
-  { id: 'preset-7', title: '국어 문법 루틴', steps: [
+
+  { id: 'preset-7',  title: '국어 문법 루틴', steps: [
     { step: '문법 개념 정리', minutes: 15 },
     { step: '문제 적용', minutes: 15 },
     { step: '틀린 문법 다시 암기', minutes: 10 },
   ], tags: ['#개념이해'], origin: 'preset' },
-  { id: 'preset-8', title: '비문학 분석 루틴', steps: [
+
+  { id: 'preset-8',  title: '비문학 분석 루틴', steps: [
     { step: '지문 1개 읽기', minutes: 10 },
     { step: '글 구조 그리기', minutes: 10 },
     { step: '문제 풀이 + 해설 확인', minutes: 10 },
   ], tags: ['#개념이해'], origin: 'preset' },
+
   { id: 'preset-10', title: '빠른 오답 다시보기 루틴', steps: [
     { step: '지난 오답노트 빠르게 훑기', minutes: 10 },
     { step: '틀렸던 이유 요약', minutes: 5 },
     { step: '비슷한 문제 1개 풀기', minutes: 5 },
   ], tags: ['#복습정리'], origin: 'preset' },
+
   { id: 'preset-11', title: '모르는 것만 모으는 루틴', steps: [
     { step: '공부하다 모르는 것 따로 표시', minutes: 5 },
     { step: '모음 정리노트 만들기', minutes: 15 },
     { step: '정답 찾아서 복습', minutes: 10 },
   ], tags: ['#복습정리'], origin: 'preset' },
+
   { id: 'preset-12', title: '수학 스스로 설명 루틴 (Feynman Technique)', steps: [
     { step: '수학 개념 하나 선택', minutes: 5 },
     { step: '초등학생에게 설명하듯 써보기', minutes: 10 },
     { step: '부족한 부분 다시 학습', minutes: 10 },
-  ], tags: ['#개념이해', '#자기주도'], origin: 'preset' },
+  ], tags: ['#개념이해'], origin: 'preset' },
+
   { id: 'preset-13', title: '핵심 개념 정리 루틴', steps: [
     { step: '개념 하나 선택', minutes: 5 },
     { step: '핵심 문장 3줄로 정리', minutes: 10 },
     { step: '예시 추가 및 노트 정리', minutes: 10 },
   ], tags: ['#개념이해'], origin: 'preset' },
+
   { id: 'preset-15', title: '유형별 문제 루틴', steps: [
     { step: '집중하고 싶은 문제 유형 선정', minutes: 5 },
     { step: '유형에 맞는 문제 풀이', minutes: 25 },
   ], tags: ['#문제풀이'], origin: 'preset' },
+
   { id: 'preset-16', title: '실전 모드 루틴', steps: [
     { step: '시험지 형식 문제 세트 풀기', minutes: 30 },
     { step: '채점 및 오답 분석', minutes: 10 },
   ], tags: ['#문제풀이'], origin: 'preset' },
+
   { id: 'preset-19', title: '스스로 출제 루틴', steps: [
     { step: '암기 내용 기반 문제 만들기', minutes: 10 },
     { step: '직접 풀고 정답 확인 및 수정', minutes: 10 },
   ], tags: ['#암기'], origin: 'preset' },
+
   { id: 'preset-20', title: '단어장 복습 루틴', steps: [
     { step: '외운 단어 10개 랜덤 테스트', minutes: 10 },
     { step: '틀린 단어 집중 암기', minutes: 10 },
   ], tags: ['#암기'], origin: 'preset' },
 ];
 
+type TabKey = 'fav' | 'preset' | 'mine';
+
 export default function RoutinePage() {
   const router = useRouter();
+  const { tab } = useLocalSearchParams<{ tab?: string }>();
 
   // ==== UI 상태 ====
   const [search, setSearch] = useState('');
-  const [activeTab, setActiveTab] = useState<'fav' | 'preset' | 'mine'>('fav'); // ⭐ 즐겨찾기 탭 기본
-  const [selectedTag, setSelectedTag] = useState<string>('');
+  // ✅ 기본 탭을 'mine'으로 변경
+  const [activeTab, setActiveTab] = useState<TabKey>('mine');
+  const [selectedTag, setSelectedTag] = useState<AllowedTag | ''>('');
 
   // ==== 커스텀 루틴 입력 ====
   const [myTitle, setMyTitle] = useState('');
-  const RECOMMENDED_TAGS = ['#개념이해', '#문제풀이', '#암기', '#복습정리', '#시험준비', '#영어', '#자기주도'];
-  const [selectedCreateTags, setSelectedCreateTags] = useState<string[]>([]);
-  const [customTagText, setCustomTagText] = useState('');
+  const RECOMMENDED_TAGS: AllowedTag[] = [...ALLOWED_TAGS];
+  const [selectedCreateTags, setSelectedCreateTags] = useState<AllowedTag[]>([]);
   const [stepInput, setStepInput] = useState('');
   const [stepMinutes, setStepMinutes] = useState('');
   const [stepList, setStepList] = useState<Step[]>([]);
@@ -132,6 +153,14 @@ export default function RoutinePage() {
   const scrollRef = useRef<ScrollView | null>(null);
   const KEYBOARD_OFFSET = Platform.OS === 'ios' ? 10 : 0;
 
+  // ✅ URL 쿼리로 초기 탭 제어 (예: /routine?tab=mine)
+  useEffect(() => {
+    const t = Array.isArray(tab) ? tab[0] : tab;
+    if (t === 'fav' || t === 'preset' || t === 'mine') {
+      setActiveTab(t);
+    }
+  }, [tab]);
+
   // 초기 로드: 내 루틴 + 즐겨찾기 + 실행기록
   useEffect(() => {
     (async () => {
@@ -142,11 +171,21 @@ export default function RoutinePage() {
           AsyncStorage.getItem(RUN_KEY),
         ]);
 
-        if (rawRoutines) setUserRoutines(JSON.parse(rawRoutines));
+        if (rawRoutines) {
+          const parsed: Routine[] = JSON.parse(rawRoutines);
+          // 혹시 예전에 다른 태그가 저장돼 있었다면 허용 태그로만 정화
+          const cleaned = parsed.map(r => ({
+            ...r,
+            tags: r.tags.filter((t): t is AllowedTag => (ALLOWED_TAGS as readonly string[]).includes(t)),
+          }));
+          setUserRoutines(cleaned);
+          if (JSON.stringify(cleaned) !== rawRoutines) {
+            await AsyncStorage.setItem(STORAGE_KEY, JSON.stringify(cleaned));
+          }
+        }
 
         if (rawFav) {
           const parsed = JSON.parse(rawFav);
-          // v1(array) -> v2(map) 마이그레이션
           if (Array.isArray(parsed)) {
             const now = Date.now();
             const map: Record<string, number> = {};
@@ -238,18 +277,11 @@ export default function RoutinePage() {
     }
   }, [activeTab, selectedTag, search, userRoutines, favoriteIds, runStats, favorites]);
 
-  // 태그 칩 토글
-  const toggleCreateTag = (tag: string) => {
+  // 태그 칩 토글 (허용 태그만)
+  const toggleCreateTag = (tag: AllowedTag) => {
     setSelectedCreateTags((prev) =>
       prev.includes(tag) ? prev.filter((t) => t !== tag) : [...prev, tag]
     );
-  };
-
-  // 사용자 정의 태그 문자열을 '#...'로 정규화
-  const normalizeCustomTag = (text: string) => {
-    const trimmed = text.trim();
-    if (!trimmed) return null;
-    return trimmed.startsWith('#') ? trimmed : `#${trimmed}`;
   };
 
   const handleAddRoutine = async () => {
@@ -258,11 +290,8 @@ export default function RoutinePage() {
       return;
     }
 
-    const extra = normalizeCustomTag(customTagText);
-    const tagSet = new Set<string>([
-      ...selectedCreateTags,
-      ...(extra ? [extra] : []),
-    ]);
+    // 선택된 허용 태그만 저장
+    const tagSet = new Set<AllowedTag>(selectedCreateTags);
 
     const newItem: Routine = {
       id: `mine-${Date.now()}`,
@@ -278,7 +307,6 @@ export default function RoutinePage() {
     // 입력값 리셋
     setMyTitle('');
     setSelectedCreateTags([]);
-    setCustomTagText('');
     setStepList([]);
     setShowMessage(true);
     setActiveTab('mine');
@@ -400,7 +428,7 @@ export default function RoutinePage() {
           zIndex: 1,
         }}
       >
-        {/* 상단: 제목 + 즐겨찾기(출처 뱃지 제거됨) */}
+        {/* 상단: 제목 + 즐겨찾기 */}
         <View style={{ flexDirection: 'row', justifyContent: 'space-between', alignItems: 'center', marginBottom: 6 }}>
           <View style={{ flex: 1, paddingRight: 8 }}>
             <Text style={{ fontWeight: 'bold', fontSize: 18 }} numberOfLines={1}>
@@ -416,7 +444,7 @@ export default function RoutinePage() {
           </TouchableOpacity>
         </View>
 
-        {/* 태그 */}
+        {/* 태그 (허용 4개만 이미 보장) */}
         <View style={{ flexDirection: 'row', flexWrap: 'wrap', marginBottom: 8 }}>
           {routine.tags.map((tag, j) => (
             <Text key={j} style={{ color: '#059669', fontSize: 14, marginRight: 6, marginBottom: 6 }}>
@@ -494,7 +522,7 @@ export default function RoutinePage() {
             { key: 'preset', label: `기본 (${PRESET_ROUTINES.length})` },
             { key: 'mine',   label: `내 루틴 (${userRoutines.length})` },
           ].map(({ key, label }) => {
-            const k = key as 'fav' | 'preset' | 'mine';
+            const k = key as TabKey;
             const active = activeTab === k;
             return (
               <TouchableOpacity
@@ -520,7 +548,7 @@ export default function RoutinePage() {
           value={search}
           onChangeText={setSearch}
           placeholder="루틴 제목 또는 태그 검색"
-        style={{
+          style={{
             height: 40,
             borderColor: '#ccc',
             borderWidth: 1,
@@ -530,7 +558,7 @@ export default function RoutinePage() {
           }}
         />
 
-        {/* 🏷️ 태그 필터 */}
+        {/* 🏷️ 태그 필터 (4개만) */}
         <View style={{ flexDirection: 'row', flexWrap: 'wrap', gap: 10, marginBottom: 18 }}>
           {RECOMMENDED_TAGS.map((tag) => {
             const active = selectedTag === tag;
@@ -587,7 +615,7 @@ export default function RoutinePage() {
                 }}
               />
 
-              {/* 해시태그: 칩 + 사용자 정의(자동 #) */}
+              {/* 해시태그: 칩 선택만 (자유 입력 제거) */}
               <Text style={{ marginBottom: 8, fontWeight: '600' }}>태그 선택</Text>
               <View style={{ flexDirection: 'row', flexWrap: 'wrap', gap: 8, marginBottom: 10 }}>
                 {RECOMMENDED_TAGS.map((tag) => {
@@ -609,43 +637,6 @@ export default function RoutinePage() {
                     </TouchableOpacity>
                   );
                 })}
-              </View>
-
-              <View style={{ flexDirection: 'row', alignItems: 'center', gap: 8, marginBottom: 12 }}>
-                <TextInput
-                  value={customTagText}
-                  onChangeText={setCustomTagText}
-                  placeholder="사용자 정의 태그 (예: 시험준비)"
-                  style={{
-                    flex: 1,
-                    height: 40,
-                    borderWidth: 1,
-                    borderColor: '#CBD5E1',
-                    borderRadius: 8,
-                    paddingHorizontal: 12,
-                    backgroundColor: '#fff',
-                  }}
-                />
-                <TouchableOpacity
-                  onPress={() => {
-                    const t = normalizeCustomTag(customTagText);
-                    if (!t) return;
-                    if (!selectedCreateTags.includes(t)) {
-                      setSelectedCreateTags((prev) => [...prev, t]);
-                    }
-                    setCustomTagText('');
-                  }}
-                  style={{
-                    height: 40,
-                    paddingHorizontal: 12,
-                    borderRadius: 8,
-                    backgroundColor: '#10B981',
-                    justifyContent: 'center',
-                    alignItems: 'center',
-                  }}
-                >
-                  <Text style={{ color: '#fff', fontWeight: '600' }}>추가</Text>
-                </TouchableOpacity>
               </View>
 
               {/* 단계 입력 */}

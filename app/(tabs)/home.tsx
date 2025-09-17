@@ -7,7 +7,6 @@ import React, { useCallback, useEffect, useMemo, useRef, useState } from 'react'
 import {
   AppState,
   AppStateStatus,
-  InteractionManager,
   Pressable,
   ScrollView,
   StyleSheet,
@@ -33,7 +32,17 @@ type Step = { step: string; minutes: number };
 type Routine = { id: string; title: string; steps: Step[]; origin: 'preset' | 'custom' };
 type RunEvent = { title: string; usedAt: string };
 
-/* ---------- Preset Routines (기본 제공) ---------- */
+type ScoreMeta = {
+  streak: number;
+  recent: number;
+  since: number | null;
+  streakN: number;
+  recentN: number;
+  longN: number;
+  score: number;
+};
+
+/* ---------- Preset Routines ---------- */
 const PRESETS: Routine[] = [
   {
     id: 'preset-words',
@@ -143,6 +152,8 @@ function secondsFromRoutine(r: any): number {
 /* ---------- Scoring ---------- */
 const RECENT_WINDOW_DAYS = 14;
 const LONG_UNUSED_CAP_DAYS = 21;
+const W_STREAK = 0.5, W_RECENT = 0.3, W_LONG = 0.2;
+
 function daysDiff(fromYmd: string, toYmd: string) {
   const [fy, fm, fd] = fromYmd.split('-').map(Number);
   const [ty, tm, td] = toYmd.split('-').map(Number);
@@ -197,18 +208,19 @@ export default function HomePage() {
   const [plans, setPlans] = useState<Plan[]>([]);
   const [memo, setMemo] = useState<string>('');
 
-  // ✅ 오늘의 루틴 (리빌드)
+  // ✅ 오늘의 루틴
   const [routines, setRoutines] = useState<Routine[]>([]);
-  const [ranked, setRanked] = useState<(Routine & { _score: number })[]>([]);
+  const [ranked, setRanked] = useState<(Routine & { _meta: ScoreMeta })[]>([]);
   const [ri, setRi] = useState(0);
   const [launching, setLaunching] = useState(false);
+  const [showWhy, setShowWhy] = useState(false);
 
-  // ✅ 축하 배너(오버레이 제거: 터치 블로킹 원천 차단)
   const [showPlanBanner, setShowPlanBanner] = useState(false);
   const [showGoalBanner, setShowGoalBanner] = useState(false);
 
   const dayOffsetRef = useRef<number>(DEFAULT_DAY_START_MIN);
   const lastLogicalDateRef = useRef<string>('');
+  const navigatingRef = useRef(false); // 🚫 중복 네비 가드
 
   const ORDER: Priority[] = ['필수', '중요', '선택'];
 
@@ -311,7 +323,7 @@ export default function HomePage() {
     setStudiedSeconds(studySec + routineSec);
   };
 
-  /* ---------- 오늘의 루틴: 프리셋 + 커스텀 합치기 ---------- */
+  /* ---------- 오늘의 루틴 ---------- */
   const loadRoutines = useCallback(async () => {
     const STORAGE_KEY = '@userRoutinesV1';
     let custom: Routine[] = [];
@@ -331,6 +343,7 @@ export default function HomePage() {
         }
       }
     } catch {}
+
     const map = new Map<string, Routine>();
     for (const c of custom) map.set(c.title, c);
     for (const p of PRESETS) if (!map.has(p.title)) map.set(p.title, p);
@@ -339,7 +352,40 @@ export default function HomePage() {
     return merged;
   }, []);
 
-  /* ---------- 추천 점수 계산 ---------- */
+  const RECENT_WINDOW_DAYS = 14;
+  const LONG_UNUSED_CAP_DAYS = 21;
+  const W_STREAK = 0.5, W_RECENT = 0.3, W_LONG = 0.2;
+
+  const daysDiff = (fromYmd: string, toYmd: string) => {
+    const [fy, fm, fd] = fromYmd.split('-').map(Number);
+    const [ty, tm, td] = toYmd.split('-').map(Number);
+    const from = new Date(fy, fm - 1, fd);
+    const to = new Date(ty, tm - 1, td);
+    return Math.round((to.getTime() - from.getTime()) / (1000 * 60 * 60 * 24));
+  };
+  const calcStreak = (usedDaysSet: Set<string>, today: string) => {
+    let streak = 0;
+    let cursor = today;
+    while (usedDaysSet.has(cursor)) {
+      streak += 1;
+      const [y, m, d] = cursor.split('-').map(Number);
+      const prev = new Date(y, m - 1, d - 1);
+      cursor = `${prev.getFullYear()}-${String(prev.getMonth() + 1).padStart(2, '0')}-${String(prev.getDate()).padStart(2, '0')}`;
+    }
+    return streak;
+  };
+  const calcRecentCount = (usedDates: string[], today: string) =>
+    usedDates.filter((ymd) => {
+      const diff = daysDiff(ymd, today);
+      return diff >= 0 && diff <= RECENT_WINDOW_DAYS;
+    }).length;
+
+  const lastUsedDaysAgo = (usedDates: string[], today: string): number | null => {
+    if (usedDates.length === 0) return null;
+    const last = usedDates.reduce((a, b) => (a > b ? a : b));
+    return daysDiff(last, today);
+  };
+
   const refreshRanking = useCallback(async (_uid: string) => {
     const list = await loadRoutines();
     const today = getTodayKSTDateString();
@@ -353,35 +399,30 @@ export default function HomePage() {
     }
     const anyUsed = Object.values(usedMap).some(arr => arr.length > 0);
 
-    const scored = list.map((r) => {
+    const withMeta = list.map((r) => {
       const dates = usedMap[r.title] ?? [];
       const usedSet = new Set(dates);
       const streak = calcStreak(usedSet, today);
       const recent = calcRecentCount(dates, today);
       const since = lastUsedDaysAgo(dates, today);
 
-      // 정규화
-      const streakN = Math.min(streak, 7) / 7; // 0~1
-      const recentN = Math.min(recent, 7) / 7; // 0~1
+      const streakN = Math.min(streak, 7) / 7;
+      const recentN = Math.min(recent, 7) / 7;
       const longN = since === null ? 0.6 : Math.min(Math.max(since, 0), LONG_UNUSED_CAP_DAYS) / LONG_UNUSED_CAP_DAYS;
 
-      // 가중치
-      const W_STREAK = 0.5, W_RECENT = 0.3, W_LONG = 0.2;
       let score = W_STREAK * streakN + W_RECENT * recentN + W_LONG * longN;
-
-      // 콜드스타트 완화
       if (dates.length === 0 && !anyUsed) score += 0.06;
       if (dates.length === 0 && anyUsed)  score += 0.01;
 
-      return { ...r, _score: score };
+      const meta: ScoreMeta = { streak, recent, since, streakN, recentN, longN, score };
+      return { ...r, _meta: meta };
     });
 
-    scored.sort((a, b) => b._score - a._score);
-    setRanked(scored);
+    withMeta.sort((a, b) => b._meta.score - a._meta.score);
+    setRanked(withMeta);
     setRi(0);
   }, [loadRoutines]);
 
-  /* ---------- 자동 완료 반영(원인 무관) ---------- */
   const autoMarkPlanDoneFromLastStudy = useCallback(async (_uid: string) => {
     try {
       const lastContent = await AsyncStorage.getItem('content');
@@ -408,6 +449,7 @@ export default function HomePage() {
         setUid(null);
         setRoutines([]); setRanked([]);
         setShowPlanBanner(false); setShowGoalBanner(false);
+        setShowWhy(false);
         return;
       }
       setUid(user.uid);
@@ -453,7 +495,7 @@ export default function HomePage() {
     return () => clearInterval(id);
   }, [uid, autoMarkPlanDoneFromLastStudy, refreshRanking]);
 
-  /* ---------- Congrats 배너 (오버레이 X) ---------- */
+  /* ---------- Congrats 배너 ---------- */
   const allDone = totalCount > 0 && completedCount === totalCount;
   useEffect(() => { setShowPlanBanner(allDone); }, [allDone]);
   useEffect(() => {
@@ -473,12 +515,17 @@ export default function HomePage() {
 
   const nextRoutine = () => {
     if (!ranked.length) return;
+    setShowWhy(false);
     setRi((i) => (i + 1) % ranked.length);
   };
 
+  // ✅ 핵심: InteractionManager 제거 + 중복 네비 가드
   const startRoutine = async () => {
-    if (!uid || launching) return;
+    if (!uid) return;
+    if (launching || navigatingRef.current) return;
+
     setLaunching(true);
+    navigatingRef.current = true;
     try {
       const today = getTodayKSTDateString();
       const raw = await AsyncStorage.getItem(k(RUN_EVENTS_KEY_BASE, uid));
@@ -487,16 +534,18 @@ export default function HomePage() {
       await AsyncStorage.setItem(k(RUN_EVENTS_KEY_BASE, uid), JSON.stringify(events));
 
       const packed = serializeSteps(rec.steps || []);
-      // 안전한 네비게이션 시점 (UI 블로킹 방지)
-      InteractionManager.runAfterInteractions(() => {
-        try {
-          router.push({ pathname: '/routine/run', params: { title: rec.title, steps: packed, setCount: String(1), origin: 'home' } } as any);
-        } catch {
-          try { router.push('/routine/run' as any); } catch {}
-        }
-      });
+      // 단순 push (터치큐 꼬임 방지)
+      router.push({
+        pathname: '/routine/run',
+        params: { title: rec.title, steps: packed, setCount: '1', origin: 'home' }
+      } as any);
+    } catch (e) {
+      console.warn('startRoutine error', e);
     } finally {
-      setTimeout(() => setLaunching(false), 300);
+      setTimeout(() => {
+        setLaunching(false);
+        navigatingRef.current = false;
+      }, 250);
     }
   };
 
@@ -519,21 +568,13 @@ export default function HomePage() {
   };
 
   const remainingSeconds = Math.max(0, goalMinutes * 60 - studiedSeconds);
-/* ============================================================
-==============================================================/
-
-
-
-
-
-
+  const meta = (rec as any)?._meta as ScoreMeta | undefined;
 
   /* ---------- Render ---------- */
   return (
     <ScrollView contentContainerStyle={styles.container} keyboardShouldPersistTaps="handled">
       <Text style={styles.header}>오늘도 StudyFit과 함께 해요!</Text>
 
-      {/* 메모 */}
       {memo?.trim()?.length > 0 && (
         <View style={styles.memoBanner}>
           <Text style={styles.memoTitle}>오늘의 메모</Text>
@@ -541,7 +582,6 @@ export default function HomePage() {
         </View>
       )}
 
-      {/* ✅ 축하 배너(스크롤 내 고정, 오버레이 없음 → 터치 블로킹 원천 제거) */}
       {showPlanBanner && (
         <View style={[styles.banner, { backgroundColor: '#ECFDF5', borderColor: '#A7F3D0' }]}>
           <Text style={styles.bannerTitle}>오늘의 공부 계획 완료!</Text>
@@ -571,17 +611,43 @@ export default function HomePage() {
         </View>
       )}
 
-      {/* ✅ 오늘의 루틴 (완전 리빌드) */}
       <View style={styles.recommendBox}>
         <View style={styles.rowSpaceBetween}>
           <Text style={styles.recommendTitle}>📘 오늘의 루틴</Text>
-          <TouchableOpacity onPress={nextRoutine}>
-            <Text style={styles.changeButtonText}>다른 루틴 보기</Text>
-          </TouchableOpacity>
+          <View style={{ flexDirection: 'row', alignItems: 'center', gap: 12 }}>
+            <TouchableOpacity onPress={() => setShowWhy(v => !v)}>
+              <Text style={styles.changeButtonText}>💡 추천 기준</Text>
+            </TouchableOpacity>
+            <TouchableOpacity onPress={ranked.length > 1 ? nextRoutine : undefined}>
+              <Text style={[styles.changeButtonText, ranked.length < 2 && { opacity: 0.5 }]}>
+                다른 루틴 보기
+              </Text>
+            </TouchableOpacity>
+          </View>
         </View>
 
-        <Text style={styles.routineTitle}>{rec?.title ?? '루틴'}</Text>
-        <Text style={styles.totalTime}>({totalMinutesOf(rec)}분)</Text>
+        <View style={{ flexDirection: 'row', alignItems: 'baseline', justifyContent: 'space-between' }}>
+          <View style={{ flexShrink: 1 }}>
+            <Text style={styles.routineTitle}>{rec?.title ?? '루틴'}</Text>
+            <Text style={styles.totalTime}>({(rec?.steps ?? []).reduce((s, x) => s + (x.minutes || 0), 0)}분)</Text>
+          </View>
+          {ranked.length > 0 && (
+            <Text style={{ fontSize: 12, color: '#374151', fontWeight: '700' }}>
+              {ri + 1}위 / {ranked.length}
+            </Text>
+          )}
+        </View>
+
+        {showWhy && meta && (
+          <View style={styles.whyBox}>
+            <Text style={styles.whyTitle}>이 루틴이 추천된 이유</Text>
+            <WhyRow label="연속 실행(최근 연속 일수)" value={`${meta.streak}일`} ratio={meta.streakN} weight={W_STREAK} />
+            <WhyRow label="최근 사용(14일 내 횟수)" value={`${meta.recent}회`} ratio={meta.recentN} weight={W_RECENT} />
+            <WhyRow label="오랫동안 미사용 보정" value={meta.since === null ? '이력 없음' : `${meta.since}일 경과`} ratio={meta.longN} weight={W_LONG} />
+            <Text style={styles.whyScore}>가중 점수: {meta.score.toFixed(3)}</Text>
+            <Text style={styles.whyFootnote}>※ 연속/최근 사용을 우선(0.5/0.3), 오래 미사용 루틴에도 기회(0.2)</Text>
+          </View>
+        )}
 
         <View style={styles.stepsBox}>
           {(rec?.steps ?? []).map((s, i) => (
@@ -599,11 +665,9 @@ export default function HomePage() {
         </TouchableOpacity>
       </View>
 
-      {/* 공부 시간 */}
       <Text style={styles.timeText}>오늘 공부 시간: {formatHMS(studiedSeconds)}</Text>
-      <Text style={styles.timeText}>남은 목표 시간: {formatHMS(remainingSeconds)}</Text>
+      <Text style={styles.timeText}>남은 목표 시간: {formatHMS(Math.max(0, goalMinutes * 60 - studiedSeconds))}</Text>
 
-      {/* 진행률 */}
       {totalCount > 0 && (
         <View style={styles.progressWrap}>
           <View style={styles.progressBar}>
@@ -613,7 +677,6 @@ export default function HomePage() {
         </View>
       )}
 
-      {/* 오늘의 계획 */}
       <View style={styles.todoBox}>
         <View style={{ flexDirection: 'row', justifyContent: 'space-between', alignItems: 'center' }}>
           <Text style={styles.sectionTitle}>오늘의 계획</Text>
@@ -677,6 +740,24 @@ export default function HomePage() {
   );
 }
 
+/* ---------- 추천 기준 바 ---------- */
+function WhyRow({
+  label, value, ratio, weight,
+}: { label: string; value: string; ratio: number; weight: number }) {
+  const pct = Math.round(Math.max(0, Math.min(1, ratio)) * 100);
+  return (
+    <View style={{ marginTop: 6 }}>
+      <View style={{ flexDirection: 'row', justifyContent: 'space-between' }}>
+        <Text style={{ fontSize: 12, color: '#111827', fontWeight: '700' }}>{label}</Text>
+        <Text style={{ fontSize: 12, color: '#374151' }}>{value} · 기여 {Math.round(weight*100)}%</Text>
+      </View>
+      <View style={{ height: 8, backgroundColor: '#E5E7EB', borderRadius: 999, overflow: 'hidden', marginTop: 4 }}>
+        <View style={{ width: `${pct}%`, height: '100%', backgroundColor: '#3B82F6' }} />
+      </View>
+    </View>
+  );
+}
+
 /* ---------- Styles ---------- */
 const styles = StyleSheet.create({
   container: { padding: 20, backgroundColor: '#FFFFFF', flexGrow: 1 },
@@ -686,13 +767,7 @@ const styles = StyleSheet.create({
   memoTitle: { fontSize: 13, color: '#6B7280', marginBottom: 4, fontWeight: '600' },
   memoText: { fontSize: 14, color: '#111827', marginTop: 8 },
 
-  /* ✅ 축하 배너(스크롤 내) */
-  banner: {
-    borderWidth: 1,
-    padding: 14,
-    borderRadius: 12,
-    marginBottom: 12,
-  },
+  banner: { borderWidth: 1, padding: 14, borderRadius: 12, marginBottom: 12 },
   bannerTitle: { fontSize: 16, fontWeight: '800', color: '#111827', marginBottom: 6 },
   bannerBody: { fontSize: 13, color: '#111827', marginBottom: 10 },
   bannerRow: { flexDirection: 'row', gap: 10 },
@@ -700,7 +775,6 @@ const styles = StyleSheet.create({
   bannerBtnTextPrimary: { color: '#FFFFFF', fontWeight: '800' },
   bannerBtnText: { color: '#111827', fontWeight: '700' },
 
-  /* 오늘의 루틴 */
   recommendBox: { backgroundColor: '#E0ECFF', padding: 20, borderRadius: 16, marginBottom: 30, marginTop: 10 },
   rowSpaceBetween: { flexDirection: 'row', justifyContent: 'space-between', alignItems: 'center' },
   recommendTitle: { fontSize: 16, fontWeight: '600', marginBottom: 8 },
@@ -711,6 +785,11 @@ const styles = StyleSheet.create({
   startButton: { backgroundColor: '#3B82F6', paddingVertical: 12, borderRadius: 10, alignItems: 'center', marginTop: 6 },
   startButtonText: { color: '#fff', fontSize: 15, fontWeight: '800' },
   changeButtonText: { fontSize: 13, color: '#2563EB' },
+
+  whyBox: { backgroundColor: '#EFF6FF', borderWidth: 1, borderColor: '#BFDBFE', borderRadius: 12, padding: 12, marginBottom: 10 },
+  whyTitle: { fontSize: 12, fontWeight: '800', color: '#111827' },
+  whyScore: { fontSize: 12, fontWeight: '800', color: '#111827', marginTop: 8 },
+  whyFootnote: { fontSize: 11, color: '#374151', marginTop: 2 },
 
   timeText: { fontSize: 14, marginBottom: 8, marginLeft: 25 },
 
