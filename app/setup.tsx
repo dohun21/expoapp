@@ -1,6 +1,7 @@
+// app/setup/index.tsx
 import AsyncStorage from '@react-native-async-storage/async-storage';
 import { Picker } from '@react-native-picker/picker';
-import { useRouter } from 'expo-router';
+import { useLocalSearchParams, useRouter } from 'expo-router';
 import { onAuthStateChanged } from 'firebase/auth';
 import React, { useCallback, useEffect, useRef, useState } from 'react';
 import {
@@ -100,6 +101,9 @@ function favoriteFromStats(stats: Record<string, number>): number {
 
 export default function SetupScreen() {
   const router = useRouter();
+  const { from } = useLocalSearchParams<{ from?: string }>();
+  const showBack = from === 'home'; // 홈의 '계획 추가'에서 진입한 경우만 표시
+
   const [uid, setUid] = useState<string | null>(null);
 
   /* ---------- 상태 ---------- */
@@ -274,12 +278,27 @@ export default function SetupScreen() {
     setPlans((prev) => prev.map((p) => (p.id === id ? { ...p, done: !p.done } : p)));
   }, []);
 
-  /* ---------- 저장 ---------- */
+  /* ---------- 저장 (입력창 내용도 함께 저장!) ---------- */
   const savePlansAndGoal = useCallback(async () => {
     if (!uid) return;
     try {
       const totalMinutes = Math.max(0, hours * 60 + minutes);
-      await AsyncStorage.setItem(k(PLANS_KEY_BASE, uid), JSON.stringify(plans));
+
+      // 🔥 패치: 입력창에 남아있는 내용도 강제로 포함
+      const withTyping = newPlanText.trim()
+        ? [
+            {
+              id: `${Date.now()}`,
+              content: newPlanText.trim(),
+              priority: newPlanPriority,
+              done: false,
+              createdAt: new Date().toISOString(),
+            },
+            ...plans,
+          ]
+        : plans;
+
+      await AsyncStorage.setItem(k(PLANS_KEY_BASE, uid), JSON.stringify(withTyping));
       await AsyncStorage.setItem(k(GOAL_KEY_BASE, uid), String(totalMinutes));
       await AsyncStorage.setItem(k(LAST_SETUP_DATE_KEY_BASE, uid), getTodayKST());
 
@@ -292,7 +311,7 @@ export default function SetupScreen() {
       console.error(e);
       Alert.alert('에러', '저장 중 문제가 발생했습니다.');
     }
-  }, [uid, plans, hours, minutes, router, updateGoalStats]);
+  }, [uid, plans, newPlanText, newPlanPriority, hours, minutes, router, updateGoalStats]);
 
   /* ---------- 휠 변경 시 자동 적용(무알림) ---------- */
   const scheduleAutoApply = useCallback(
@@ -322,7 +341,6 @@ export default function SetupScreen() {
   }, [favoriteGoalMins, scheduleAutoApply]);
 
   /* ---------- 렌더러 ---------- */
-  // ✅ 하단 보조 텍스트(우선순위 · 시간) 제거 완료
   const renderPlan = ({ item }: { item: Plan }) => (
     <View
       style={{
@@ -358,7 +376,6 @@ export default function SetupScreen() {
         >
           {item.content}
         </Text>
-        {/* 보조라인(우선순위 · 시간) 삭제 */}
       </Pressable>
       <TouchableOpacity onPress={() => removePlan(item.id)}>
         <Text style={{ color: COLOR_MUTED, fontSize: 14 }}>삭제</Text>
@@ -411,8 +428,6 @@ export default function SetupScreen() {
     );
   };
 
-  const totalIsZero = hours === 0 && minutes === 0;
-
   /* ---------- 슬라이드 ---------- */
   const onPagerLayout = (w: number) => {
     layoutWidthRef.current = w;
@@ -423,17 +438,6 @@ export default function SetupScreen() {
     const idx = Math.round(e.nativeEvent.contentOffset.x / w);
     setPageIndex(idx);
   };
-/* ------------------------------------------------------------*/
-
-
-
-
-
-
-
-
-
-
 
   /* ---------- UI ---------- */
   return (
@@ -458,6 +462,19 @@ export default function SetupScreen() {
             keyboardShouldPersistTaps="handled"
           >
             <Pressable onPress={Keyboard.dismiss} style={{ flex: 1 }}>
+              {/* ▶︎ 뒤로가기: 홈에서 '계획 추가'로 진입한 경우에만, 박스 없이 "<"만 표시 */}
+              {showBack && (
+                <View style={{ marginBottom: 8 }}>
+                  <TouchableOpacity
+                    onPress={() => router.back()}
+                    hitSlop={{ top: 8, bottom: 8, left: 8, right: 8 }}
+                    style={{ alignSelf: 'flex-start', paddingVertical: 4, paddingHorizontal: 2 }}
+                  >
+                    <Text style={{ fontSize: 22, color: COLOR_TEXT }}>{'<'}</Text>
+                  </TouchableOpacity>
+                </View>
+              )}
+
               {/* 배너 */}
               <View
                 style={{
@@ -588,24 +605,33 @@ export default function SetupScreen() {
                 </View>
               </View>
 
-              {/* ✅ Page1 하단: '다음' 버튼 */}
+              {/* ✅ Page1 하단: '다음' 버튼 (0시간이면 비활성/진행 불가) */}
               <TouchableOpacity
                 onPress={() => {
+                  if (hours === 0 && minutes === 0) {
+                    Alert.alert('목표 시간 필요', '목표 공부 시간을 설정한 뒤 다음으로 이동할 수 있어요.');
+                    return;
+                  }
                   const w = layoutWidthRef.current || 0;
                   setPageIndex(1);
                   pagerRef.current?.scrollTo({ x: w, animated: true });
                 }}
+                disabled={hours === 0 && minutes === 0}
                 style={{
-                  backgroundColor: COLOR_PRIMARY,
+                  backgroundColor: hours === 0 && minutes === 0 ? '#9CA3AF' : COLOR_PRIMARY,
                   borderRadius: 12,
                   height: 48,
                   alignItems: 'center',
                   justifyContent: 'center',
+                  opacity: hours === 0 && minutes === 0 ? 0.8 : 1,
                   ...CARD_SHADOW,
                 }}
               >
-                <Text style={{ color: '#FFF', fontWeight: '900' }}>다음</Text>
+                <Text style={{ color: '#FFF', fontWeight: '900' }}>
+                  {hours === 0 && minutes === 0 ? '목표 시간을 설정하세요' : '다음'}
+                </Text>
               </TouchableOpacity>
+
             </Pressable>
           </ScrollView>
 

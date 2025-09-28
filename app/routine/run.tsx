@@ -1,4 +1,5 @@
 // app/routine/run.tsx
+import AsyncStorage from '@react-native-async-storage/async-storage';
 import { useFocusEffect, useLocalSearchParams, useRouter } from 'expo-router';
 import { onAuthStateChanged } from 'firebase/auth';
 import { addDoc, collection, serverTimestamp } from 'firebase/firestore';
@@ -8,21 +9,43 @@ import { auth, db } from '../../firebaseConfig';
 
 type StepItem = { step: string; minutes: number };
 
+/* ---------- KST logical date helpers ---------- */
+const DAY_START_OFFSET_KEY_BASE = 'dayStartOffsetMin';
+const DEFAULT_DAY_START_MIN = 240;
+const k = (base: string, uid: string) => `${base}_${uid}`;
+function ymdKST(offsetMin: number) {
+  const now = new Date();
+  const kstNow = new Date(now.toLocaleString('en-US', { timeZone: 'Asia/Seoul' }));
+  const shifted = new Date(kstNow.getTime() - (offsetMin || 0) * 60000);
+  const y = shifted.getFullYear();
+  const m = String(shifted.getMonth() + 1).padStart(2, '0');
+  const d = String(shifted.getDate()).padStart(2, '0');
+  return `${y}-${m}-${d}`;
+}
+
+/** steps 쿼리 파라미터(string | string[]) 안전 파싱 */
+function parseSteps(raw: string | string[] | undefined): StepItem[] {
+  const s = typeof raw === 'string' ? raw : Array.isArray(raw) ? raw.join('|') : '';
+  if (!s) return [];
+  return s
+    .split('|')
+    .map((chunk) => chunk.trim())
+    .filter(Boolean)
+    .map((chunk) => {
+      const [text, m] = chunk.split(',');
+      const min = Number(m);
+      return { step: (text ?? '').trim(), minutes: Number.isFinite(min) && min > 0 ? min : 0 };
+    })
+    .filter(it => it.step.length > 0 && it.minutes >= 0);
+}
+
 export default function RoutineRunScreen() {
   const router = useRouter();
 
   // --- params ---
   const { title, steps } = useLocalSearchParams();
   const routineTitle = typeof title === 'string' ? title : '루틴';
-  const stepsRaw = typeof steps === 'string' ? steps : '';
-  const stepList: StepItem[] = stepsRaw
-    .split('|')
-    .map((s) => s.trim())
-    .filter(Boolean)
-    .map((s) => {
-      const [text, minutes] = s.split(',');
-      return { step: (text ?? '').trim(), minutes: Number(minutes) || 0 };
-    });
+  const stepList: StepItem[] = useMemo(() => parseSteps(steps), [steps]);
 
   // --- auth ---
   const [uid, setUid] = useState<string | null>(null);
@@ -40,30 +63,21 @@ export default function RoutineRunScreen() {
   const [stepIndex, setStepIndex] = useState(0);
   const [remainingTime, setRemainingTime] = useState(stepList[0]?.minutes ? stepList[0].minutes * 60 : 0);
 
-  // refs(인터벌/현재 인덱스/스텝리스트 스냅샷)
+  // refs(인터벌/현재 인덱스/스텝리스트 스냅샷/실행상태)
   const timerRef = useRef<ReturnType<typeof setInterval> | null>(null);
   const stepIndexRef = useRef(0);
   const stepsRef = useRef(stepList);
   const runningRef = useRef(false);
 
-  useEffect(() => {
-    stepsRef.current = stepList;
-  }, [stepList]);
-
-  useEffect(() => {
-    stepIndexRef.current = stepIndex;
-  }, [stepIndex]);
-
-  useEffect(() => {
-    runningRef.current = isRunning;
-  }, [isRunning]);
+  useEffect(() => { stepsRef.current = stepList; }, [stepList]);
+  useEffect(() => { stepIndexRef.current = stepIndex; }, [stepIndex]);
+  useEffect(() => { runningRef.current = isRunning; }, [isRunning]);
 
   // --- totals/progress ---
   const totalSeconds = useMemo(
     () => stepList.reduce((acc, s) => acc + Math.max(0, s.minutes) * 60, 0),
     [stepList]
   );
-
   const currentStepTotalSec = (stepList[stepIndex]?.minutes || 0) * 60;
 
   const completedSeconds = useMemo(() => {
@@ -74,32 +88,26 @@ export default function RoutineRunScreen() {
 
   const progress = totalSeconds > 0 ? completedSeconds / totalSeconds : 0;
 
-  // --- 안전한 단일 타이머: 의존성으로 남은 시간에 묶지 않는다 ---
+  // --- 단일 타이머 ---
   const startTick = useCallback(() => {
-    if (timerRef.current) return; // 이미 실행 중
+    if (timerRef.current) return;
     timerRef.current = setInterval(() => {
-      // 매 틱마다 남은 시간을 안전하게 감소
       setRemainingTime((prev) => {
-        // 아직 시작 전이거나 실행중이 아니면 변화 없음
         if (!runningRef.current) return prev;
 
         if (prev <= 1) {
-          // 다음 스텝으로 넘어갈지/완료할지 결정
           const curIdx = stepIndexRef.current;
           const nextIdx = curIdx + 1;
           const steps = stepsRef.current;
 
           if (nextIdx < steps.length) {
             const next = steps[nextIdx];
-            // 인덱스/남은시간 모두 "동일 tick"에서 갱신
             setStepIndex(nextIdx);
             return Math.max(0, (next?.minutes || 0) * 60);
           } else {
-            // 마지막 스텝 종료 → 완료
             setIsFinished(true);
             setIsRunning(false);
             runningRef.current = false;
-            // 타이머 즉시 정지
             if (timerRef.current) {
               clearInterval(timerRef.current);
               timerRef.current = null;
@@ -107,8 +115,6 @@ export default function RoutineRunScreen() {
             return 0;
           }
         }
-
-        // 일반적인 카운트다운
         return prev - 1;
       });
     }, 1000);
@@ -121,25 +127,16 @@ export default function RoutineRunScreen() {
     }
   }, []);
 
-  // 실행/일시정지 전환에 따라 인터벌 관리
   useEffect(() => {
-    if (isStarted && isRunning && !isFinished) {
-      startTick();
-    } else {
-      stopTick();
-    }
-    return () => {
-      // 의존성 변경/언마운트 시 항상 정리
-      stopTick();
-    };
+    if (isStarted && isRunning && !isFinished) startTick();
+    else stopTick();
+    return () => stopTick();
   }, [isStarted, isRunning, isFinished, startTick, stopTick]);
 
-  // 화면 포커스 변화 시 항상 인터벌/상태 정리 (뒤로가기/탭 전환 등)
+  // 포커스 아웃 시 깔끔 정리
   useFocusEffect(
     useCallback(() => {
-      // 포커스 IN
       return () => {
-        // 포커스 OUT
         stopTick();
         runningRef.current = false;
         setIsRunning(false);
@@ -153,7 +150,6 @@ export default function RoutineRunScreen() {
     const sec = Math.max(0, s) % 60;
     return `${String(m).padStart(2, '0')}:${String(sec).padStart(2, '0')}`;
   };
-
   const formatHM = (sec: number) => {
     const safe = Math.max(0, sec);
     const h = Math.floor(safe / 3600);
@@ -163,20 +159,34 @@ export default function RoutineRunScreen() {
     return `${m}분`;
   };
 
+  // 저장(홈 합산과 호환되도록 필드 포함)
   const saveRoutineRecord = async () => {
     if (!uid) {
       Alert.alert('로그인 필요', '로그인이 필요합니다.');
       return;
     }
     try {
+      // 개인별 논리적 시작시간 반영 → logicalDateKST 저장
+      const offsetRaw = await AsyncStorage.getItem(k(DAY_START_OFFSET_KEY_BASE, uid));
+      const v = Number(offsetRaw);
+      const offsetMin = Number.isFinite(v) ? v : DEFAULT_DAY_START_MIN;
+      const logicalDateKST = ymdKST(offsetMin);
+
       await addDoc(collection(db, 'routineRecords'), {
         uid,
         title: routineTitle,
         steps: stepList,
+        totalSeconds,
+        totalMinutes: Math.round(totalSeconds / 60),
+        logicalDateKST,            // ✅ 홈 집계 1순위 키
+        createdAt: serverTimestamp(),
         completedAt: serverTimestamp(),
+        endedAt: serverTimestamp(), // ✅ 명시적 종료타임스탬프
+        platform: Platform.OS,
       });
       setIsSaved(true);
-    } catch {
+    } catch (e) {
+      console.error(e);
       Alert.alert('오류', '저장 실패');
     }
   };
@@ -187,16 +197,19 @@ export default function RoutineRunScreen() {
   const nextStep = stepList[stepIndex + 1];
 
   return (
-    <ScrollView style={{ flex: 1, backgroundColor: '#FFFFFF' }} contentContainerStyle={{ paddingBottom: 40 }}>
+    <ScrollView
+      style={{ flex: 1, backgroundColor: '#FFFFFF' }}
+      contentContainerStyle={{ paddingBottom: 40 }}
+      keyboardShouldPersistTaps="handled"
+    >
       {/* Header */}
       <View style={{ paddingTop: TOP_SPACING, paddingHorizontal: 20, paddingBottom: 6 }}>
         <View style={{ flexDirection: 'row', alignItems: 'center' }}>
           <TouchableOpacity
             onPress={() => {
-              // 뒤로갈 때도 인터벌 정리
               stopTick();
               setIsRunning(false);
-              router.back();
+              router.back(); // 뒤로가기 안정 처리
             }}
             style={{ padding: 8, marginRight: 6, borderRadius: 10 }}
           >
@@ -269,7 +282,8 @@ export default function RoutineRunScreen() {
                   setStepIndex(0);
                   stepIndexRef.current = 0;
                   setRemainingTime((stepList[0]?.minutes || 0) * 60);
-                  startTick(); // 즉시 인터벌 시작
+                  // 즉시 인터벌 시작(첫 프레임 지연 방지)
+                  startTick();
                 }}
                 style={{
                   backgroundColor: hasSteps ? '#3B82F6' : '#93C5FD',
@@ -295,21 +309,8 @@ export default function RoutineRunScreen() {
 
               {/* 전체 진행률 바 */}
               <View style={{ marginBottom: 14 }}>
-                <View
-                  style={{
-                    height: 10,
-                    borderRadius: 999,
-                    backgroundColor: '#E5E7EB',
-                    overflow: 'hidden',
-                  }}
-                >
-                  <View
-                    style={{
-                      width: `${Math.round(progress * 100)}%`,
-                      height: '100%',
-                      backgroundColor: '#60A5FA',
-                    }}
-                  />
+                <View style={{ height: 10, borderRadius: 999, backgroundColor: '#E5E7EB', overflow: 'hidden' }}>
+                  <View style={{ width: `${Math.round(progress * 100)}%`, height: '100%', backgroundColor: '#60A5FA' }} />
                 </View>
                 <Text style={{ marginTop: 6, fontSize: 12, color: '#6B7280' }}>
                   전체 진행률 {Math.round(progress * 100)}% · 남은 시간 {formatHM(totalSeconds - completedSeconds)}
@@ -330,15 +331,7 @@ export default function RoutineRunScreen() {
                 }}
               >
                 <Text style={{ fontSize: 12, color: '#6B7280', marginBottom: 8 }}>현재 단계</Text>
-                <Text
-                  style={{
-                    fontSize: 20,
-                    fontWeight: '700',
-                    marginBottom: 10,
-                    color: '#1F2937',
-                    textAlign: 'center',
-                  }}
-                >
+                <Text style={{ fontSize: 20, fontWeight: '700', marginBottom: 10, color: '#1F2937', textAlign: 'center' }}>
                   {stepList[stepIndex]?.step ?? '—'}
                 </Text>
                 <Text style={{ fontSize: 44, fontWeight: '800', color: '#1D4ED8', letterSpacing: 1 }}>
@@ -373,22 +366,10 @@ export default function RoutineRunScreen() {
                         borderColor: '#F3F4F6',
                       }}
                     >
-                      <Text
-                        style={{
-                          fontSize: 14,
-                          color: active ? '#1F2937' : '#374151',
-                          fontWeight: active ? '800' : '400',
-                        }}
-                      >
+                      <Text style={{ fontSize: 14, color: active ? '#1F2937' : '#374151', fontWeight: active ? '800' : '400' }}>
                         {idx + 1}. {st.step}
                       </Text>
-                      <Text
-                        style={{
-                          fontSize: 12,
-                          color: active ? '#1D4ED8' : '#6B7280',
-                          fontWeight: active ? '700' : '400',
-                        }}
-                      >
+                      <Text style={{ fontSize: 12, color: active ? '#1D4ED8' : '#6B7280', fontWeight: active ? '700' : '400' }}>
                         {st.minutes}분
                       </Text>
                     </View>
@@ -449,18 +430,6 @@ export default function RoutineRunScreen() {
                   <Text style={{ color: '#1E40AF', fontWeight: '700' }}>다음 ▶</Text>
                 </TouchableOpacity>
               </View>
-
-              {/* 뒤로가기 */}
-              <TouchableOpacity
-                onPress={() => {
-                  stopTick();
-                  setIsRunning(false);
-                  router.back();
-                }}
-                style={{ alignSelf: 'center', paddingVertical: 14, paddingHorizontal: 18, marginTop: 16 }}
-              >
-                <Text style={{ color: '#6B7280' }}>뒤로가기</Text>
-              </TouchableOpacity>
             </>
           )
         ) : (

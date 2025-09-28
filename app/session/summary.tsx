@@ -1,3 +1,4 @@
+// app/studyrecord/summary.tsx
 import AsyncStorage from '@react-native-async-storage/async-storage';
 import { useLocalSearchParams, useRouter } from 'expo-router';
 import { onAuthStateChanged } from 'firebase/auth';
@@ -6,7 +7,11 @@ import React, { useEffect, useState } from 'react';
 import { Alert, ScrollView, Text, TouchableOpacity, View } from 'react-native';
 import { auth, db } from '../../firebaseConfig';
 
-/* ===== Utils ===== */
+/* ===== Const / Utils ===== */
+const DAY_START_OFFSET_KEY_BASE = 'dayStartOffsetMin';
+const DEFAULT_DAY_START_MIN = 240;
+const k = (base: string, uid: string) => `${base}_${uid}`;
+
 function getTodayKSTDateString() {
   const now = new Date();
   const utcMs = now.getTime() + now.getTimezoneOffset() * 60000;
@@ -14,6 +19,15 @@ function getTodayKSTDateString() {
   const y = kst.getFullYear();
   const m = String(kst.getMonth() + 1).padStart(2, '0');
   const d = String(kst.getDate()).padStart(2, '0');
+  return `${y}-${m}-${d}`;
+}
+function ymdKST(offsetMin: number) {
+  const now = new Date();
+  const kstNow = new Date(now.toLocaleString('en-US', { timeZone: 'Asia/Seoul' }));
+  const shifted = new Date(kstNow.getTime() - (offsetMin || 0) * 60000);
+  const y = shifted.getFullYear();
+  const m = String(shifted.getMonth() + 1).padStart(2, '0');
+  const d = String(shifted.getDate()).padStart(2, '0');
   return `${y}-${m}-${d}`;
 }
 function extractSeconds(str: string) {
@@ -45,8 +59,11 @@ export default function SessionSummary() {
   const [studyTime, setStudyTime] = useState('');
   const [memo, setMemo] = useState('');
   const [stars, setStars] = useState(0);
-  const [feelings, setFeelings] = useState<string[]>([]);
-  const [goalStatus, setGoalStatus] = useState('');
+
+  /** 하나만 선택되는 느낌 */
+  const [feeling, setFeeling] = useState<string | null>(null);
+
+  const [goalStatus, setGoalStatus] = useState<'success' | 'fail' | 'none' | ''>('');
 
   useEffect(() => {
     const unsub = onAuthStateChanged(auth, (user) => { if (user) setUid(user.uid); });
@@ -59,8 +76,8 @@ export default function SessionSummary() {
     return () => unsub();
   }, []);
 
-  const toggleFeeling = (tag: string) => {
-    setFeelings((prev) => (prev.includes(tag) ? prev.filter((t) => t !== tag) : [...prev, tag]));
+  const selectFeeling = (tag: string) => {
+    setFeeling((prev) => (prev === tag ? null : tag));
   };
 
   const handleSubmit = async () => {
@@ -68,6 +85,12 @@ export default function SessionSummary() {
       Alert.alert('로그인이 필요해요', '다시 로그인한 뒤 저장해 주세요.');
       return;
     }
+
+    // 개인화된 논리적 시작시간 로드 (없으면 240분)
+    const offsetRaw = await AsyncStorage.getItem(k(DAY_START_OFFSET_KEY_BASE, uid));
+    const offsetMinNum = Number(offsetRaw);
+    const offsetMin = Number.isFinite(offsetMinNum) ? offsetMinNum : DEFAULT_DAY_START_MIN;
+    const logicalDate = ymdKST(offsetMin);
 
     const seconds = extractSeconds(studyTime || '0분 0초');
     const record = {
@@ -77,9 +100,11 @@ export default function SessionSummary() {
       studySeconds: seconds,
       memo,
       stars,
-      feelings,
+      feelings: feeling ? [feeling] : [],
       goalStatus,
-      recordDate: getTodayKSTDateString(),
+      recordDate: getTodayKSTDateString(), // 레거시 호환
+      logicalDateKST: logicalDate,        // ✅ 홈 집계 핵심 키
+      endedAt: Timestamp.now(),           // 명시적 종료시각
       createdAt: Timestamp.now(),
       uid,
       mode: Array.isArray(mode) ? mode[0] : mode || 'flow',
@@ -88,20 +113,17 @@ export default function SessionSummary() {
     try {
       await addDoc(collection(db, 'studyRecords'), record);
 
-      // 유저 누적 분 갱신(있으면)
+      // 총 공부 분 업데이트
       const userRef = doc(db, 'users', uid);
       const userSnap = await getDoc(userRef);
       const oldMinutes = userSnap.exists() ? userSnap.data().totalStudyMinutes || 0 : 0;
       await updateDoc(userRef, { totalStudyMinutes: oldMinutes + Math.floor(seconds / 60) });
 
-      // ✅ 방금 완료한 계획 ID를 홈에서 자동 완료 처리할 수 있도록 저장
-      //    (pause 모드가 아닌 경우에만 의미가 있음)
       const lastDonePlanId = (Array.isArray(donePlanId) ? donePlanId[0] : donePlanId) || '';
       if (!isPaused && lastDonePlanId) {
         await AsyncStorage.setItem(`lastDonePlanId_${uid}`, String(lastDonePlanId));
       }
 
-      // 다음으로 이동: pause 모드면 홈으로, 아니면 배치/큐 이어가기
       if (isPaused) {
         router.replace('/home' as any);
       } else {
@@ -120,6 +142,27 @@ export default function SessionSummary() {
   };
 
   const submitLabel = isPaused ? '기록 저장하고 홈으로' : '기록 저장하고 다음으로';
+
+  /* ===== UI 데이터 ===== */
+  const POSITIVE = ['#완전집중', '#몰입성공', '#의욕부활'];
+  const REFLECT  = ['#다음엔더잘할래', '#조금힘들었음'];
+
+  const Pill = ({ tag }: { tag: string }) => {
+    const active = feeling === tag;
+    return (
+      <TouchableOpacity
+        onPress={() => selectFeeling(tag)}
+        style={{
+          paddingHorizontal: 12,
+          paddingVertical: 6,
+          borderRadius: 20,
+          backgroundColor: active ? '#3B82F6' : '#F4F4F5',
+        }}
+      >
+        <Text style={{ fontSize: 12, color: active ? '#fff' : '#000' }}>{tag}</Text>
+      </TouchableOpacity>
+    );
+  };
 
   return (
     <ScrollView style={{ flex: 1, backgroundColor: 'white', paddingHorizontal: 24, paddingTop: 50 }}>
@@ -147,24 +190,23 @@ export default function SessionSummary() {
         </View>
       </View>
 
+      {/* 긍정 / 회고 */}
       <View style={{ marginBottom: 32 }}>
         <Text style={{ fontSize: 14, fontWeight: 'bold', marginBottom: 8 }}>🧠 오늘의 느낌은?</Text>
-        <View style={{ flexDirection: 'row', flexWrap: 'wrap', gap: 8 }}>
-          {['#완전집중', '#조금힘들었음', '#의욕부활', '#몰입성공', '#다음엔더잘할래'].map((tag) => (
-            <TouchableOpacity
-              key={tag}
-              onPress={() => toggleFeeling(tag)}
-              style={{
-                paddingHorizontal: 10,
-                paddingVertical: 4,
-                borderRadius: 20,
-                backgroundColor: feelings.includes(tag) ? '#3B82F6' : '#F4F4F5',
-              }}
-            >
-              <Text style={{ fontSize: 12, color: feelings.includes(tag) ? '#fff' : '#000' }}>{tag}</Text>
-            </TouchableOpacity>
-          ))}
+
+        <Text style={{ fontSize: 12, color: '#6B7280', marginBottom: 8 }}>좋았던 포인트</Text>
+        <View style={{ flexDirection: 'row', flexWrap: 'wrap', gap: 8, marginBottom: 12 }}>
+          {POSITIVE.map((tag) => <Pill key={tag} tag={tag} />)}
         </View>
+
+        <Text style={{ fontSize: 12, color: '#6B7280', marginBottom: 8 }}>다음에 보완할 점</Text>
+        <View style={{ flexDirection: 'row', flexWrap: 'wrap', gap: 8 }}>
+          {REFLECT.map((tag) => <Pill key={tag} tag={tag} />)}
+        </View>
+
+        <Text style={{ marginTop: 10, fontSize: 11, color: '#9CA3AF' }}>
+          해시태그는 하나만 선택돼요. 같은 태그를 다시 누르면 해제돼요.
+        </Text>
       </View>
 
       <View style={{ marginBottom: 40 }}>
@@ -177,7 +219,7 @@ export default function SessionSummary() {
           ].map((opt) => (
             <TouchableOpacity
               key={opt.value}
-              onPress={() => setGoalStatus(opt.value)}
+              onPress={() => setGoalStatus(opt.value as 'success' | 'fail' | 'none')}
               style={{
                 paddingHorizontal: 10,
                 paddingVertical: 4,
@@ -212,3 +254,4 @@ export default function SessionSummary() {
     </ScrollView>
   );
 }
+

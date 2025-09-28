@@ -32,7 +32,7 @@ export default function LoginPage() {
 
     try {
       await signInWithEmailAndPassword(auth, email, pw);
-      router.push('/setup');
+      router.push('/home');
     } catch (error: any) {
       alert('로그인 실패: ' + error.message);
     }
