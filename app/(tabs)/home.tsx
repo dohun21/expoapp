@@ -599,7 +599,7 @@ export default function HomePage() {
     const safe = Math.max(0, Math.floor(seconds));
     const h = Math.floor(safe / 3600);
     const m = Math.floor((safe % 3600) / 60);
-    return `${h}시간 ${m}분`;
+    return `${h}시간 ${m}분 입니다`;
   }
 
   const goalSeconds = Math.max(0, goalMinutes * 60);
