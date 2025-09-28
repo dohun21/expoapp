@@ -617,7 +617,7 @@ export default function HomePage() {
 
   useEffect(() => {
     if (allPlansDone && !prevAllPlansDoneRef.current) {
-      Alert.alert('🎉', '오늘의 공부 계획을 모두 완료했어요.');
+      Alert.alert('🎉', '오늘의 공부 계획 클리어!');
     }
     prevAllPlansDoneRef.current = allPlansDone;
   }, [allPlansDone]);
