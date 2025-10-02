@@ -35,7 +35,8 @@ type RoutineRun = {
  * 키/유틸
  * =======================*/
 const WEEKLY_KEY_BASE = 'weeklyPlannerV1';
-const ROUTINE_TAB_KEY = '@userRoutinesV1';
+const ROUTINE_TAB_KEY = '@userRoutinesV1';           // (구) 사용자 루틴 라이브러리
+const ROUTINE_LIBRARY_KEY_BASE = 'routineLibraryV1';  // (신) 사용자 루틴 라이브러리
 const DAY_START_OFFSET_KEY_BASE = 'dayStartOffsetMin';
 const DEFAULT_DAY_START_MIN = 240; // 04:00
 const DRAFTS_KEY_BASE = 'routineRunDraftsV1';
@@ -240,24 +241,60 @@ export default function WeeklyRun() {
       setLoadingList(true);
       try {
         const weekly = await readWeekly(uid);
-        const offset = await getDayOffset(uid);
-        const key = dowKey(getLogicalKSTDate(offset));
-        const list: WeeklyPlanItem[] = pickDayList(weekly, key) || [];
 
-        // 라이브러리: 사용자 + 프리셋 병합
-        const libRaw = await AsyncStorage.getItem(ROUTINE_TAB_KEY);
-        const userLib: RoutineLibItem[] = libRaw ? JSON.parse(libRaw) : [];
-        const mergedLib: RoutineLibItem[] = [
-          ...userLib,
-          ...PRESETS.filter(p => !userLib.find(u => u.id === p.id)),
-        ];
-        const findLib = (id?: string) => id ? mergedLib.find(x => x.id === id) : undefined;
+        // ✅ 1) 논리적 하루 시작(예: 04:00) 기준 요일
+        const offset = await getDayOffset(uid);
+        const keyLogical = dowKey(getLogicalKSTDate(offset));
+
+        // ✅ 2) KST 자정 기준 요일 (Home과 동일한 기준)
+        const keyKst = dowKey(getLogicalKSTDate(0));
+
+        // 우선순위: 논리적 → KST → 폴백(첫 배열)
+        let rawList: WeeklyPlanItem[] =
+          (pickDayList(weekly, keyLogical) as WeeklyPlanItem[]) || [];
+
+        if (!rawList.length && keyKst !== keyLogical) {
+          rawList = (pickDayList(weekly, keyKst) as WeeklyPlanItem[]) || [];
+        }
+
+        if (!rawList.length) {
+          const anyFallback = pickDayList(weekly, '') as WeeklyPlanItem[];
+          if (Array.isArray(anyFallback) && anyFallback.length) {
+            rawList = anyFallback;
+          }
+        }
+
+        // 라이브러리: (구) @userRoutinesV1 + (신) routineLibraryV1_<uid> + PRESETS 병합
+        const libFromOldKeyRaw = await AsyncStorage.getItem(ROUTINE_TAB_KEY);
+        const libFromNewKeyRaw = await AsyncStorage.getItem(k(ROUTINE_LIBRARY_KEY_BASE, uid));
+
+        const libOld: RoutineLibItem[] = libFromOldKeyRaw ? JSON.parse(libFromOldKeyRaw) : [];
+        const libNew: RoutineLibItem[] = libFromNewKeyRaw ? JSON.parse(libFromNewKeyRaw) : [];
+
+        const mergedMap: Record<string, RoutineLibItem> = {};
+        [...libOld, ...libNew].forEach((r: any) => {
+          if (!r) return;
+          const id = String(r.id ?? '');
+          const steps: Step[] = Array.isArray(r.steps)
+            ? r.steps.map((s: any) => ({ step: String(s?.step || ''), minutes: Number(s?.minutes || 0) }))
+            : [];
+          if (!id || steps.length === 0) return;
+          mergedMap[id] = { id, title: String(r.title ?? '루틴'), steps, tags: Array.isArray(r.tags) ? r.tags.map((t:any)=>String(t)) : [] };
+        });
+        PRESETS.forEach(p => {
+          if (!mergedMap[p.id]) mergedMap[p.id] = { id: p.id, title: p.title, steps: p.steps, tags: (p as any).tags || [] };
+        });
+        const mergedLib: RoutineLibItem[] = Object.values(mergedMap);
+        const findLib = (id?: string) => (id ? mergedLib.find(x => x.id === id) : undefined);
 
         const materialized: RoutineRun[] = [];
-        for (const it of list) {
-          let steps: Step[] | undefined = Array.isArray(it?.steps)
-            ? it!.steps!.map((s: any) => ({ step: String(s?.step || ''), minutes: Number(s?.minutes || 0) }))
-            : undefined;
+        for (const it0 of rawList) {
+          const it = { ...it0, planId: String((it0 as any)?.planId ?? (it0 as any)?.id ?? '') } as WeeklyPlanItem;
+
+          let steps: Step[] | undefined =
+            Array.isArray(it?.steps)
+              ? it!.steps!.map((s: any) => ({ step: String(s?.step || ''), minutes: Number(s?.minutes || 0) }))
+              : undefined;
 
           if ((!steps || steps.length === 0) && it?.routineId) {
             const found = findLib(it.routineId);
@@ -268,14 +305,15 @@ export default function WeeklyRun() {
           }
           if (!steps || steps.length === 0) continue;
 
-          const durationMin = minutesOf(steps) * Math.max(1, Number(it?.setCount || 1));
+          const setCount = Math.max(1, Number(it?.setCount || 1));
+          const durationMin = minutesOf(steps) * setCount;
           const startAtMin = parseHMToMin(it?.startAt);
 
           materialized.push({
             planId: it.planId,
             title: String(it?.title || '루틴'),
-            content: String(it?.content || ''),
-            setCount: Math.max(1, Number(it?.setCount || 1)),
+            content: String((it as any)?.content || (it as any)?.subject || ''),
+            setCount,
             steps,
             startAtMin,
             durationMin,
@@ -465,13 +503,19 @@ export default function WeeklyRun() {
     startRoutineAtIndex(nxt);
   }
 
+  // 세트/단계 진행
   function nextStepOrNextSetOrFinish() {
     stopTimer();
     if (totalSteps === 0) return;
 
     if (isLastStepInSet) {
-      // 루틴 종료 → 체크인 모달
-      finishCurrentRoutine();
+      if (!isLastSetInRoutine) {
+        setSetIdx((s) => s + 1);
+        setStepIdx(0);
+        setTimeout(() => setRunning(true), 200);
+      } else {
+        finishCurrentRoutine();
+      }
     } else {
       setStepIdx((i) => i + 1);
       setTimeout(() => setRunning(true), 200);
@@ -494,8 +538,8 @@ export default function WeeklyRun() {
     setSetIdx(0);
     setStepIdx(0);
     elapsedRef.current = 0;
-    setReady(true);       // 준비 화면 먼저
-    setRunning(false);    // 시작 버튼 눌러야 카운트 시작
+    setReady(true);      // 준비 화면 먼저
+    setRunning(false);   // 시작 버튼 눌러야 카운트 시작
   }
 
   /* =========================
@@ -613,6 +657,11 @@ export default function WeeklyRun() {
   }
 
   // 실행 중 화면
+  const nextButtonLabel =
+    (totalSteps > 0 && stepIdx === totalSteps - 1 && setIdx === Math.max(1, setCount) - 1)
+      ? ((routineIdx >= queue.length - 1) ? '전체 마치기' : '루틴 마치기')
+      : (isLastStepInSet ? '다음 세트' : '다음 단계');
+
   return (
     <View style={styles.page}>
       <Text style={styles.runTitle} numberOfLines={2}>{routineTitle}</Text>
@@ -643,11 +692,7 @@ export default function WeeklyRun() {
             <Text style={styles.btnText}>{running ? '일시정지' : '재개'}</Text>
           </TouchableOpacity>
           <TouchableOpacity onPress={nextStepOrNextSetOrFinish} style={[styles.btn, styles.blue]}>
-            <Text style={styles.btnText}>
-              { (totalSteps > 0 && stepIdx === totalSteps - 1 && setIdx === Math.max(1, setCount) - 1)
-                ? ( (routineIdx >= queue.length - 1) ? '전체 마치기' : '루틴 마치기' )
-                : '다음 단계' }
-            </Text>
+            <Text style={styles.btnText}>{nextButtonLabel}</Text>
           </TouchableOpacity>
         </View>
 
@@ -680,7 +725,7 @@ export default function WeeklyRun() {
         </ScrollView>
       </View>
 
-      {/* 체크인 모달 */}
+      {/* 체크인 모달 (summary 스타일) */}
       <Modal visible={showCheckin} transparent animationType="slide" onRequestClose={() => setShowCheckin(false)}>
         <View style={styles.modalBackdrop}>
           <View style={styles.sheet}>

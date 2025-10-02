@@ -6,11 +6,9 @@ import React, { useEffect, useMemo, useRef, useState } from 'react';
 import {
   Alert,
   Dimensions,
-  Linking,
   Modal,
   NativeScrollEvent,
   NativeSyntheticEvent,
-  Platform,
   ScrollView,
   StyleSheet,
   Text,
@@ -20,38 +18,30 @@ import {
 } from 'react-native';
 import { auth } from '../../firebaseConfig';
 
-// ✅ Firestore 하이브리드 유틸 (inline)
+// Firestore
 import { doc, getDoc, serverTimestamp, setDoc } from 'firebase/firestore';
 import { db } from '../../firebaseConfig';
-
-// ✅ 알림 (expo-notifications)
-import * as Notifications from 'expo-notifications';
-
-/* ===== 알림 핸들러(포그라운드 표시) — 타입 안전하게 ===== */
-Notifications.setNotificationHandler({
-  handleNotification: () =>
-    Promise.resolve({
-      shouldShowAlert: true,
-      shouldPlaySound: false,
-      shouldSetBadge: false,
-    } as Notifications.NotificationBehavior),
-});
 
 /* ===== Keys / Types ===== */
 const k = (base: string, uid: string) => `${base}_${uid}`;
 const WEEKLY_KEY_BASE = 'weeklyPlannerV1';
-const ROUTINE_TAB_KEY = '@userRoutinesV1';
-const NOTI_KEY_BASE = 'weeklyPlannerNotiIdsV1'; // planId -> notiId
+const STORAGE_KEY = '@userRoutinesV1'; // routine.tsx와 동일
 
 type Step = { step: string; minutes: number };
-type RoutineItem = { id: string; title: string; steps: Step[]; tags: string[]; origin: 'preset'|'user' };
+type Routine = {
+  id: string;
+  title: string;
+  steps: Step[];
+  tags: string[];
+  origin: 'preset' | 'custom' | 'user';
+};
+
 type WeeklyPlanItem = { planId: string; routineId: string; title: string; steps: Step[]; tags: string[]; startAt?: string };
 type WeeklyPlanner = {
   mon?: WeeklyPlanItem[]; tue?: WeeklyPlanItem[]; wed?: WeeklyPlanItem[];
   thu?: WeeklyPlanItem[]; fri?: WeeklyPlanItem[]; sat?: WeeklyPlanItem[]; sun?: WeeklyPlanItem[];
 };
 type DayKey = keyof WeeklyPlanner;
-type NotiMap = Record<string, string>;
 
 /* ===== Firestore helpers ===== */
 type WeeklyPlannerDoc = { days: WeeklyPlanner; version?: number; updatedAt?: any };
@@ -93,10 +83,8 @@ async function saveBothHybrid(uid: string, data: WeeklyPlanner) {
 /* ===== Consts ===== */
 const DAY_KEYS: DayKey[] = ['mon','tue','wed','thu','fri','sat','sun'];
 const DAY_LABEL: Record<DayKey,string> = { mon:'월',tue:'화',wed:'수',thu:'목',fri:'금',sat:'토',sun:'일' };
-const WEEKDAY_NUM: Record<DayKey, number> = { sun:1, mon:2, tue:3, wed:4, thu:5, fri:6, sat:7 }; // expo weekday 1=Sun..7=Sat
-const { width: SCREEN_W, height: SCREEN_H } = Dimensions.get('window');
+const { width: SCREEN_W } = Dimensions.get('window');
 
-// 루틴 화면 상단의 필터 태그 (파랑 칩)
 const TAGS = ['#개념이해', '#문제풀이', '#암기', '#복습정리'] as const;
 
 /* ===== Utils ===== */
@@ -104,16 +92,9 @@ const uidOrLocal=(u?:string|null)=> u ?? 'local';
 const uniqId=()=> `${Date.now()}-${Math.random().toString(36).slice(2,8)}`;
 const totalMinutes=(steps?:Step[])=> (steps??[]).reduce((a,s)=>a+(s?.minutes||0),0);
 const pad2 = (n:number)=>String(n).padStart(2,'0');
-const parseHHMM=(s:string)=>{
-  const t=String(s||'').trim(); if(t==='') return null;
-  const m=t.match(/^(\d{1,2}):(\d{2})$/); if(!m) return 'invalid';
-  const hh=+m[1], mm=+m[2]; if(hh<0||hh>23||mm<0||mm>59) return 'invalid';
-  return {h:hh,m:mm};
-};
-const nowLocal = () => new Date();
 
-/* ===== PRESETS (이 파일 안에 반드시 정의) ===== */
-const PRESETS: RoutineItem[] = [
+/* ===== PRESETS (routine.tsx와 동일) ===== */
+const PRESET_ROUTINES: Routine[] = [
   { id: 'preset-2',  title: '영단어 암기 루틴', steps: [
     { step: '영단어 외우기', minutes: 20 },
     { step: '예문 만들기', minutes: 15 },
@@ -187,95 +168,6 @@ const PRESETS: RoutineItem[] = [
   ], tags: ['#암기'], origin: 'preset' },
 ];
 
-/* ===== 알림 유틸 ===== */
-async function ensureNotificationPermission() {
-  const settings = await Notifications.getPermissionsAsync();
-  if (settings.status !== 'granted') {
-    const req = await Notifications.requestPermissionsAsync();
-    if (req.status !== 'granted') return false;
-  }
-  if (Platform.OS === 'android') {
-    try {
-      await Notifications.setNotificationChannelAsync('default', {
-        name: 'Default',
-        importance: Notifications.AndroidImportance.DEFAULT,
-      });
-    } catch {}
-  }
-  return true;
-}
-async function loadNotiMap(uid: string): Promise<NotiMap> {
-  try {
-    const raw = await AsyncStorage.getItem(k(NOTI_KEY_BASE, uid));
-    return raw ? JSON.parse(raw) : {};
-  } catch { return {}; }
-}
-async function saveNotiMap(uid: string, map: NotiMap) {
-  await AsyncStorage.setItem(k(NOTI_KEY_BASE, uid), JSON.stringify(map));
-}
-async function cancelNotiId(id?: string) {
-  if (!id) return;
-  try { await Notifications.cancelScheduledNotificationAsync(id); } catch {}
-}
-async function cancelByPlanId(uid: string, planId: string) {
-  const map = await loadNotiMap(uid);
-  if (map[planId]) {
-    await cancelNotiId(map[planId]);
-    delete map[planId];
-    await saveNotiMap(uid, map);
-  }
-}
-async function scheduleWeeklyPlanNoti(day: DayKey, plan: WeeklyPlanItem) {
-  if (!plan.startAt) return undefined;
-  const t = parseHHMM(plan.startAt);
-  if (!t || t === 'invalid') return undefined;
-
-  const weekday = WEEKDAY_NUM[day];
-  const title = plan.title || '루틴 시작';
-  const body = '루틴을 시작할 시간이에요! 눌러서 바로 실행해요.';
-
-  // ✅ iOS: 오늘인데 이미 지난 시각이면 이번 주 스킵
-  const now = nowLocal();
-  const todayW = (now.getDay() === 0 ? 1 : now.getDay() + 1);
-  const isToday = todayW === weekday;
-  const passedToday = isToday && (now.getHours() > t.h || (now.getHours() === t.h && now.getMinutes() >= t.m));
-  if (passedToday) return undefined;
-
-  const id = await Notifications.scheduleNotificationAsync({
-    content: {
-      title,
-      body,
-      data: { planId: plan.planId, routineId: plan.routineId, day },
-    },
-    trigger: {
-      repeats: true,
-      weekday,
-      hour: t.h,
-      minute: t.m,
-      second: 0,
-    } as Notifications.CalendarTriggerInput,
-  });
-  return id;
-}
-async function rescheduleSingle(uid: string, day: DayKey, plan: WeeklyPlanItem) {
-  const ok = await ensureNotificationPermission();
-  if (!ok) {
-    Alert.alert('알림 권한 필요','iOS 설정 > 앱 > 알림에서 허용을 켜주세요.',[
-      { text:'취소', style:'cancel' },
-      { text:'설정 열기', onPress:()=> Linking.openSettings?.() }
-    ]);
-    return;
-  }
-  const map = await loadNotiMap(uid);
-  if (map[plan.planId]) {
-    await cancelNotiId(map[plan.planId]);
-    delete map[plan.planId];
-  }
-  const newId = await scheduleWeeklyPlanNoti(day, plan);
-  if (newId) map[plan.planId] = newId;
-  await saveNotiMap(uid, map);
-}
-
 /* ===== Screen ===== */
 export default function SelectRoutineScreen(){
   const router = useRouter();
@@ -289,7 +181,7 @@ export default function SelectRoutineScreen(){
     return unsub;
   },[]);
 
-  const [library, setLibrary] = useState<RoutineItem[]>([]);
+  const [library, setLibrary] = useState<Routine[]>([]);
   const [weekly, setWeekly] = useState<WeeklyPlanner>({});
 
   const [search,setSearch] = useState('');
@@ -301,7 +193,7 @@ export default function SelectRoutineScreen(){
 
   // 시간 휠 모달
   const [pickerOpen,setPickerOpen]=useState(false);
-  const [targetRoutine,setTargetRoutine]=useState<RoutineItem|undefined>();
+  const [targetRoutine,setTargetRoutine]=useState<Routine|undefined>();
   const hours12 = [12,1,2,3,4,5,6,7,8,9,10,11];
   const minutes = Array.from({length:12},(_,i)=>i*5);
   const H_ITEM_H=38, M_ITEM_H=38;
@@ -313,22 +205,35 @@ export default function SelectRoutineScreen(){
 
   useEffect(()=>{
     (async ()=>{
-      // user routines merge
-      const rawMine = await AsyncStorage.getItem(ROUTINE_TAB_KEY);
-      const arr = rawMine ? JSON.parse(rawMine) : [];
-      const userList: RoutineItem[] = Array.isArray(arr) ? arr
-        .filter((r:any)=>r?.id && r?.title && Array.isArray(r?.steps))
-        .map((r:any)=>({ id:String(r.id), title:String(r.title), steps:r.steps, tags:Array.isArray(r.tags)?r.tags:[], origin:'user' })) : [];
-      const merged = [...userList, ...PRESETS.filter(p=>!userList.find(u=>u.id===p.id))];
+      // 1) 나만의 루틴 불러오기
+      const rawMine = await AsyncStorage.getItem(STORAGE_KEY);
+      const mine: Routine[] = rawMine ? JSON.parse(rawMine) : [];
+      const userList: Routine[] = Array.isArray(mine)
+        ? mine
+          .filter((r:any)=>r?.id && r?.title && Array.isArray(r?.steps))
+          .map((r:any)=>({
+            id:String(r.id),
+            title:String(r.title),
+            steps:r.steps.map((s:any)=>({ step:String(s.step), minutes:Number(s.minutes)||0 })),
+            tags:Array.isArray(r.tags)?r.tags.map((t:any)=>String(t)):[],
+            origin:'user'
+          }))
+        : [];
+
+      // 2) 프리셋과 병합 (id 중복 제거)
+      const mergedMap = new Map<string,Routine>();
+      [...PRESET_ROUTINES, ...userList].forEach(item=>{
+        if (!mergedMap.has(item.id)) mergedMap.set(item.id, item);
+      });
+      const merged = Array.from(mergedMap.values());
       setLibrary(merged);
 
-      // ⬇️ 하이브리드 로드
+      // 3) 주간 플래너 로드
       const data = await initialLoadHybrid(uidOrLocal(uid));
       setWeekly(data ?? {});
     })();
   },[uid]);
 
-  // 저장
   async function saveWeekly(data:WeeklyPlanner){
     setWeekly(data);
     await saveBothHybrid(uidOrLocal(uid), data);
@@ -336,27 +241,28 @@ export default function SelectRoutineScreen(){
 
   /* 필터링 & 페이지 구성 */
   const filtered = useMemo(()=>{
-    const q = search.trim().toLowerCase();
-    let list = library;
+    const q = search.trim();
+    let list = library.slice();
     if (activeTag) list = list.filter(r => r.tags.includes(activeTag));
     if (q) {
       list = list.filter(r =>
-        r.title.toLowerCase().includes(q) ||
-        r.tags.join(' ').toLowerCase().includes(q) ||
-        r.steps.some(s=>s.step.toLowerCase().includes(q))
+        r.title.includes(q) ||
+        r.tags.join(' ').includes(q) ||
+        r.steps.some(s=>s.step.includes(q))
       );
     }
+    list.sort((a,b)=> a.title.localeCompare(b.title, 'ko'));
     return list;
   },[library,search,activeTag]);
 
   const pages = useMemo(()=>{
-    const res: RoutineItem[][] = [];
+    const res: Routine[][] = [];
     for(let i=0;i<filtered.length;i+=2){ res.push(filtered.slice(i,i+2)); }
     return res;
   },[filtered]);
 
   /* 추가 플로우 */
-  const openPicker=(r:RoutineItem)=>{
+  const openPicker=(r:Routine)=>{
     setTargetRoutine(r);
     setAmpm('AM');
     setHIndex(0);
@@ -376,14 +282,12 @@ export default function SelectRoutineScreen(){
 
   const confirmAdd = async ()=>{
     if(!targetRoutine) return;
+
     const hh12 = hours12[hIndex] ?? 12;
     const mm = minutes[mIndex] ?? 0;
     const hour24 = ampm==='AM' ? (hh12%12) : ((hh12%12)+12);
     const time = `${pad2(hour24)}:${pad2(mm)}`;
 
-    const _uid = uidOrLocal(uid);
-
-    // 1) planId 즉시 생성해서 추가
     const newPlan: WeeklyPlanItem = {
       planId: uniqId(),
       routineId: targetRoutine.id,
@@ -405,74 +309,8 @@ export default function SelectRoutineScreen(){
 
     await saveWeekly(next);
 
-    // 2) 방금 추가한 그 항목만 즉시 예약
-    try { await rescheduleSingle(_uid, day, newPlan); } catch {}
-
     setPickerOpen(false);
     Alert.alert('추가 완료', `"${targetRoutine.title}"가 ${DAY_LABEL[day]}요일 ${selectedPreview}에 추가됐어요.`);
-  };
-
-  /* 현재 요일 편집 */
-  const [editOpen,setEditOpen]=useState(false);
-  const dayList = useMemo(()=>{
-    const arr = Array.isArray(weekly[day]) ? [...(weekly[day] as WeeklyPlanItem[])] : [];
-    arr.sort((a,b)=>{
-      if(!a.startAt && !b.startAt) return 0;
-      if(!a.startAt) return 1; if(!b.startAt) return -1;
-      return a.startAt!.localeCompare(b.startAt!);
-    });
-    return arr;
-  },[weekly,day]);
-
-  const [editedTimes,setEditedTimes] = useState<Record<string,string>>({});
-  const openEdit = ()=>{
-    const map:Record<string,string>={};
-    dayList.forEach(it=> map[it.planId]= it.startAt ?? '');
-    setEditedTimes(map);
-    setEditOpen(true);
-  };
-  const saveEdit = async ()=>{
-    for(const [pid,v] of Object.entries(editedTimes)){
-      const s=v.trim();
-      if(s!==''){
-        const m=s.match(/^(\d{1,2}):(\d{2})$/);
-        const ok = !!m && (+m[1]>=0 && +m[1]<=23 && +m[2]>=0 && +m[2]<=59);
-        if(!ok){
-          const item = dayList.find(d=>d.planId===pid);
-          Alert.alert('시간 형식', `"${item?.title}"의 시간을 HH:MM으로 입력해 주세요.`);
-          return;
-        }
-      }
-    }
-    const _uid = uidOrLocal(uid);
-
-    const next:WeeklyPlanner={...weekly};
-    const arr:WeeklyPlanItem[] = Array.isArray(next[day]) ? [...(next[day] as WeeklyPlanItem[])] : [];
-    const out = arr.map(it=>({
-      ...it,
-      startAt: (editedTimes[it.planId]||'').trim()===''?undefined:editedTimes[it.planId].trim()
-    }));
-    out.sort((a,b)=>{
-      if(!a.startAt && !b.startAt) return 0;
-      if(!a.startAt) return 1; if(!b.startAt) return -1;
-      return a.startAt!.localeCompare(b.startAt!);
-    });
-    next[day]=out;
-    await saveWeekly(next);
-
-    try {
-      await Promise.all(out.map(p => rescheduleSingle(_uid, day, p)));
-    } catch {}
-
-    setEditOpen(false);
-    Alert.alert('저장됨','세부 시간이 업데이트되었어요.');
-  };
-  const removePlan = async (pid:string)=>{
-    const _uid = uidOrLocal(uid);
-    const next:WeeklyPlanner={...weekly};
-    next[day]=(next[day]??[]).filter(it=>it.planId!==pid);
-    await saveWeekly(next);
-    try { await cancelByPlanId(_uid, pid); } catch {}
   };
 
   const goPlanner = ()=> router.push('/habit/planner');
@@ -480,10 +318,17 @@ export default function SelectRoutineScreen(){
   /* UI */
   return (
     <View style={{ flex:1, backgroundColor:'#fff' }}>
-      {/* Header */}
+      {/* Header (제목 정확히 가운데) */}
       <View style={styles.header}>
-        <TouchableOpacity onPress={()=>router.back()} style={styles.headerBtn}><Text style={styles.headerBtnText}>〈</Text></TouchableOpacity>
-        <Text style={styles.headerTitle}>루틴 추가</Text>
+        <View style={styles.headerSide}>
+          <TouchableOpacity onPress={()=>router.back()} style={styles.headerBtn}>
+            <Text style={styles.headerBtnText}>〈</Text>
+          </TouchableOpacity>
+        </View>
+        <View style={styles.headerCenter}>
+          <Text style={styles.headerTitle}>루틴 추가</Text>
+        </View>
+        <View style={styles.headerSide} />
       </View>
 
       {/* Day row */}
@@ -509,7 +354,7 @@ export default function SelectRoutineScreen(){
       </View>
 
       {/* Tag chips */}
-      <View style={{ flexDirection:'row', flexWrap:'wrap', gap:8, paddingHorizontal:16, marginTop:20, marginBottom: 12 }}>
+      <View style={{ flexDirection:'row', flexWrap:'wrap', gap:8 as any, paddingHorizontal:16, marginTop:20, marginBottom: 12 }}>
         {TAGS.map(tag=>{
           const on = activeTag===tag;
           return (
@@ -553,16 +398,14 @@ export default function SelectRoutineScreen(){
                       ))}
                     </View>
                     {r.steps.map((s, i)=>(
-                      <Text key={i} style={{ fontSize:16, marginBottom:4 }}>
-                        • {s.step} ({s.minutes}분)
-                      </Text>
+                      <Text key={i} style={{ fontSize:16, marginBottom:4 }}>• {s.step} ({s.minutes}분)</Text>
                     ))}
                     <View style={{ flexDirection:'row', gap:8 as any, marginTop:10 }}>
                       <TouchableOpacity
                         onPress={()=>openPicker(r)}
-                        style={{ flex:1, backgroundColor:'#3B82F6', height:36, borderRadius:20, justifyContent:'center', alignItems:'center' }}
+                        style={styles.addBtn}
                       >
-                        <Text style={{ color:'#fff', fontSize:14, fontWeight:'700' }}>추가</Text>
+                        <Text style={styles.addBtnText}>추가</Text>
                       </TouchableOpacity>
                     </View>
                   </View>
@@ -579,23 +422,23 @@ export default function SelectRoutineScreen(){
         )}
       </ScrollView>
 
-      {/* 설정 완료 버튼 */}
+      {/* ✅ 페이지 인디케이터 (하단 점) 복구 */}
+      {pages.length > 1 && (
+        <View style={styles.indicatorRow}>
+          {pages.map((_, i) => (
+            <View key={i} style={[styles.dot, i === pageIndex && styles.dotOn]} />
+          ))}
+        </View>
+      )}
+
+      {/* 설정 완료 */}
       <View style={styles.doneWrap}>
         <TouchableOpacity onPress={goPlanner} style={styles.doneBtn}>
           <Text style={styles.doneTxt}>설정 완료</Text>
         </TouchableOpacity>
       </View>
 
-      {/* 페이지 인디케이터 */}
-      {pages.length>1 && (
-        <View style={styles.indicatorRow}>
-          {pages.map((_,i)=>(
-            <View key={i} style={[styles.dot, i===pageIndex ? styles.dotOn : null]} />
-          ))}
-        </View>
-      )}
-
-      {/* ===== 시간 휠 모달 ===== */}
+      {/* 시간 휠 모달 */}
       <Modal visible={pickerOpen} transparent animationType="fade" onRequestClose={()=>setPickerOpen(false)}>
         <View style={styles.modalBackdrop}>
           <View style={styles.modalCard}>
@@ -671,51 +514,6 @@ export default function SelectRoutineScreen(){
           </View>
         </View>
       </Modal>
-
-      {/* ===== 현재 요일 시간 편집 ===== */}
-      <Modal visible={editOpen} transparent animationType="fade" onRequestClose={()=>setEditOpen(false)}>
-        <View style={styles.modalBackdrop}>
-          <View style={[styles.modalCard,{ maxWidth:Math.min(560, SCREEN_W-32) }]}>
-            <View style={{ flexDirection:'row', justifyContent:'space-between', alignItems:'center' }}>
-              <Text style={{ fontSize:16, fontWeight:'900' }}>세부 시간 수정 · {DAY_LABEL[day]}요일</Text>
-              <TouchableOpacity onPress={()=>setEditOpen(false)}><Text style={{ fontSize:18 }}>✕</Text></TouchableOpacity>
-            </View>
-
-            {dayList.length===0 ? (
-              <Text style={{ color:'#6B7280', marginTop:10 }}>일정이 없습니다.</Text>
-            ) : (
-              <ScrollView style={{ maxHeight:SCREEN_H*0.45, marginTop:10 }}>
-                {dayList.map(it=>{
-                  const [v, setV] = [editedTimes[it.planId] ?? '', (t:string)=>setEditedTimes(prev=>({ ...prev, [it.planId]: t }))];
-                  const s=v.trim();
-                  const invalid = s!=='' && !(s.match(/^(\d{1,2}):(\d{2})$/) && +s.slice(0,2)>=0 && +s.slice(0,2)<=23 && +s.slice(3)>=0 && +s.slice(3)<=59);
-                  return (
-                    <View key={it.planId} style={styles.editRow}>
-                      <View style={{ flex:1 }}>
-                        <Text style={styles.editTitle} numberOfLines={1}>{it.title}</Text>
-                        <Text style={styles.editMeta}>⏱ {totalMinutes(it.steps)}분</Text>
-                      </View>
-                      <TextInput
-                        placeholder="HH:MM (빈칸=미정)"
-                        value={v}
-                        onChangeText={setV}
-                        keyboardType="numbers-and-punctuation"
-                        style={[styles.timeInput, invalid && { borderColor:'#FCA5A5', backgroundColor:'#FEF2F2' }]}
-                      />
-                      <TouchableOpacity onPress={()=>removePlan(it.planId)}><Text style={styles.removeBtn}>✕</Text></TouchableOpacity>
-                    </View>
-                  );
-                })}
-              </ScrollView>
-            )}
-
-            <View style={{ flexDirection:'row', justifyContent:'flex-end', marginTop:12 }}>
-              <TouchableOpacity onPress={()=>setEditOpen(false)} style={[styles.grayBtn,{ marginRight:8 }]}><Text style={styles.grayBtnText}>닫기</Text></TouchableOpacity>
-              <TouchableOpacity onPress={saveEdit} style={styles.primaryBtn}><Text style={styles.primaryBtnText}>저장</Text></TouchableOpacity>
-            </View>
-          </View>
-        </View>
-      </Modal>
     </View>
   );
 }
@@ -726,11 +524,13 @@ const ITEM_H = 38;
 const styles = StyleSheet.create({
   header:{
     height:56, paddingHorizontal:12, flexDirection:'row', alignItems:'center',
-    justifyContent:'space-between', borderBottomWidth:1, borderColor:'#F3F4F6', backgroundColor:'#fff', marginTop:50
+    borderBottomWidth:1, borderColor:'#F3F4F6', backgroundColor:'#fff', marginTop:50
   },
+  headerSide:{ width:52, height:40, justifyContent:'center', alignItems:'center' },
   headerBtn:{ width:52, height:40, justifyContent:'center', alignItems:'center' },
   headerBtnText:{ fontSize:20, fontWeight:'800', color:'#111827' },
-  headerTitle:{ fontSize:16, fontWeight:'800', color:'#111827', marginRight: 150 },
+  headerCenter:{ flex:1, alignItems:'center', justifyContent:'center' },
+  headerTitle:{ fontSize:16, fontWeight:'800', color:'#111827' },
 
   weekRow:{ paddingHorizontal:16, paddingVertical:8, flexDirection:'row', justifyContent:'space-between', alignItems:'center' , marginTop: 10},
   dayChip:{ width:42, height:42, borderRadius:21, alignItems:'center', justifyContent:'center', backgroundColor:'#F5F7FA', borderWidth:1, borderColor:'#E5E7EB' },
@@ -749,19 +549,17 @@ const styles = StyleSheet.create({
   cardOffsetBg:{ position:'absolute', top:0, left:5, width:'95%', height:'100%', backgroundColor:'#10B981', borderRadius:16, zIndex:0 },
   card:{ backgroundColor:'#ECFDF5', padding:14, borderRadius:16, zIndex:1 },
 
-  doneWrap:{ position:'absolute', left:0, right:0, bottom:64, alignItems:'center' },
-  doneBtn:{ backgroundColor:'#10B981', paddingHorizontal:20, paddingVertical:10, borderRadius:24, elevation:2 },
-  doneTxt:{ color:'#fff', fontWeight:'900' },
+  addBtn:{ flex:1, backgroundColor:'#3B82F6', height:36, borderRadius:20, justifyContent:'center', alignItems:'center' },
+  addBtnText:{ color:'#fff', fontSize:14, fontWeight:'700', textAlign:'center' },
 
+  /* ✅ 인디케이터 스타일 */
   indicatorRow:{ position:'absolute', bottom:24, left:0, right:0, flexDirection:'row', justifyContent:'center', alignItems:'center', gap:6 as any },
   dot:{ width:8, height:8, borderRadius:4, backgroundColor:'#D1D5DB' },
   dotOn:{ backgroundColor:'#3B82F6', width:18 },
 
-  editRow:{ flexDirection:'row', alignItems:'center', borderWidth:1, borderColor:'#E5E7EB', backgroundColor:'#FFFFFF', borderRadius:12, paddingHorizontal:10, paddingVertical:8, marginBottom:8 },
-  editTitle:{ fontSize:13, fontWeight:'800', color:'#111827' },
-  editMeta:{ fontSize:11, color:'#6B7280', marginTop:2 },
-  timeInput:{ width:110, borderWidth:1, borderColor:'#E5E7EB', borderRadius:8, paddingHorizontal:10, paddingVertical:8, backgroundColor:'#F8FAFC', fontSize:13, marginLeft:8 },
-  removeBtn:{ fontSize:16, color:'#B91C1C', marginLeft:8 },
+  doneWrap:{ position:'absolute', left:0, right:0, bottom:64, alignItems:'center' },
+  doneBtn:{ backgroundColor:'#10B981', paddingHorizontal:20, paddingVertical:10, borderRadius:24, elevation:2 },
+  doneTxt:{ color:'#fff', fontWeight:'900' },
 
   grayBtn:{ backgroundColor:'#F3F4F6', paddingVertical:10, paddingHorizontal:14, borderRadius:10, alignItems:'center' },
   grayBtnText:{ color:'#111827', fontWeight:'800' },

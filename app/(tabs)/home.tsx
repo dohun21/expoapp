@@ -608,9 +608,6 @@ export default function HomePage() {
   const overSeconds = Math.max(0, studiedSeconds - goalSeconds);
   const remainingSeconds = Math.max(0, goalSeconds - studiedSeconds);
 
-  const needGoal = goalMinutes <= 0;
-  const needPlans = plans.length === 0;
-
   const allPlansDone = plans.length > 0 && plans.every(p => p.done);
   const achievedGoal = goalSeconds > 0 && studiedSeconds >= goalSeconds;
   const studyAllDone = achievedGoal || allPlansDone;
@@ -650,38 +647,7 @@ export default function HomePage() {
     <ScrollView contentContainerStyle={styles.container}>
       <Text style={styles.header}>오늘도 StudyFit과 함께 해요!</Text>
 
-      {(needGoal || needPlans) && (
-        <View style={{ gap: 12, marginBottom: 12 }}>
-          {needGoal && (
-            <View style={styles.emptyCard}>
-              <Text style={styles.emptyTitle}>오늘 목표 시간이 비어 있어요</Text>
-              <Text style={styles.emptyDesc}>하루 목표 시간을 설정하면 진행률과 남은 시간을 홈에서 표시할게요.</Text>
-              <View style={{ flexDirection: 'row', gap: 8, marginTop: 10 }}>
-                <TouchableOpacity style={styles.primaryBtn} onPress={() => setGoalModalOpen(true)}>
-                  <Text style={styles.primaryBtnText}>빠르게 설정</Text>
-                </TouchableOpacity>
-                <TouchableOpacity style={styles.secondaryBtn} onPress={() => router.push('/habit/planner')}>
-                  <Text style={styles.secondaryBtnText}>관리로 이동</Text>
-                </TouchableOpacity>
-              </View>
-            </View>
-          )}
-          {needPlans && (
-            <View style={styles.emptyCard}>
-              <Text style={styles.emptyTitle}>오늘의 공부 계획이 없어요</Text>
-              <Text style={styles.emptyDesc}>할 일을 추가하면 체크하면서 진행할 수 있어요.</Text>
-              <View style={{ flexDirection: 'row', gap: 8, marginTop: 10 }}>
-                <TouchableOpacity style={styles.primaryBtn} onPress={() => setPlanModalOpen(true)}>
-                  <Text style={styles.primaryBtnText}>할 일 추가</Text>
-                </TouchableOpacity>
-                <TouchableOpacity style={styles.secondaryBtn} onPress={() => router.push('/habit/planner')}>
-                  <Text style={styles.secondaryBtnText}>관리로 이동</Text>
-                </TouchableOpacity>
-              </View>
-            </View>
-          )}
-        </View>
-      )}
+      {/* ⛔️ 안내 배너(목표/계획 비어있음) 제거됨 */}
 
       {memo?.trim()?.length > 0 && (
         <View style={styles.memoBanner}>
@@ -710,6 +676,7 @@ export default function HomePage() {
         )}
 
         <View style={{ marginTop: 8 }}>
+          {/* ✅ 지금 실행하기 → weeklyrun으로 이동 */}
           <TouchableOpacity
             style={[styles.weekRunBtnBlue, allWeeklyDone && { backgroundColor:'#22C55E', borderColor:'#16A34A' }]}
             onPress={() => router.push('/habit/weeklyrun')}
@@ -787,6 +754,7 @@ export default function HomePage() {
       <View style={styles.todoBox}>
         <View style={{ flexDirection: 'row', justifyContent: 'space-between', alignItems: 'center' }}>
           <Text style={styles.sectionTitle}>오늘의 공부 계획</Text>
+          {/* ✅ setup에서 설정 후 홈 복귀 시 useFocusEffect로 갱신 */}
           <TouchableOpacity
             onPress={() => router.push('/setup')}
             style={{ paddingVertical: 6, paddingHorizontal: 10, backgroundColor: '#F3F4F6', borderRadius: 10 }}
@@ -798,8 +766,8 @@ export default function HomePage() {
         {plans.length === 0 && (
           <View style={styles.emptyTodoWrap}>
             <Text style={styles.emptyTodoMsg}>오늘의 공부 계획이 없어요</Text>
-            <TouchableOpacity style={styles.emptyTodoBtn} onPress={() => setPlanModalOpen(true)}>
-              <Text style={styles.emptyTodoBtnText}>추가하기</Text>
+            <TouchableOpacity style={styles.emptyTodoBtn} onPress={() => router.push('/setup')}>
+              <Text style={styles.emptyTodoBtnText}>설정하러 가기</Text>
             </TouchableOpacity>
           </View>
         )}
@@ -987,6 +955,7 @@ const styles = StyleSheet.create({
   container: { padding: 20, backgroundColor: '#FFFFFF', flexGrow: 1 },
   header: { fontSize: 20, fontWeight: 'bold', textAlign: 'center', marginTop: 70, marginBottom: 50 },
 
+  // ⛔️ emptyCard 관련 스타일은 남겨도 무방하지만 사용하지 않음
   emptyCard: {
     borderWidth: 1, borderColor: '#E5E7EB', backgroundColor: '#F9FAFB',
     borderRadius: 14, padding: 14,
